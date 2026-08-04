@@ -296,9 +296,13 @@ hiddenConflictDown = chochDown and hidBullDiv
 // HTF CONTEXT (heuristic EMA-slope bias — see limitations)
 // =====================================================================
 f_htfBias(tf) =>
-    hc = request.security(syminfo.tickerid, tf, close, lookahead=barmerge.lookahead_off)
-    ef = ta.ema(hc, htfEmaFastLen)
-    es = ta.ema(hc, htfEmaSlowLen)
+    // EMA must be computed INSIDE the security() expression, on the HTF's own bars.
+    // Computing ta.ema() locally on a request.security-fetched raw `close` series
+    // (a lower-timeframe-repeated staircase of HTF closes) does not reproduce a true
+    // HTF EMA — it distorts the effective smoothing length/alpha. See Pine docs on
+    // "avoid repainting" / recalculating indicators from request.security outputs.
+    ef = request.security(syminfo.tickerid, tf, ta.ema(close, htfEmaFastLen), lookahead=barmerge.lookahead_off)
+    es = request.security(syminfo.tickerid, tf, ta.ema(close, htfEmaSlowLen), lookahead=barmerge.lookahead_off)
     ef > es ? 1 : ef < es ? -1 : 0
 
 htfBias1 = useHTF ? f_htfBias(htf1) : 0
