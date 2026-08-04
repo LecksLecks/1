@@ -43,6 +43,8 @@ modeInput = input.string("Balanced", "Signal Mode", options=["Strict", "Balanced
 wCandle  = input.float(1.0, "Candlestick Weight", group=grpScore)
 wDiverg  = input.float(1.5, "Divergence Weight", group=grpScore)
 wHTF     = input.float(1.0, "HTF Alignment Weight", group=grpScore)
+confirmWindowBars = input.int(8, "Confirmation Window (bars)", group=grpScore, minval=0,
+     tooltip="How many bars a candlestick/divergence score stays 'active' after firing, so it can still confirm a CHoCH that lands a few bars later. 0 = only same-bar confluence counts (score effectively resets every bar). Backward-looking only — never repaints.")
 
 grpDisp = "Display"
 showMarkers   = input.bool(true, "Show Signal Markers", group=grpDisp)
@@ -204,6 +206,25 @@ if candleBearFire
         s2 += 1.0
     candleBearScore := s2
 
+// Confirmation window: a pattern's score stays "active" for confirmWindowBars bars
+// after it fires, so it can still count toward confluence when the CHoCH bar lands
+// a few bars later (which is the common case — see architecture notes). Purely
+// backward-looking (only reads bar indices/scores already known) — no repaint.
+var float lastCandleBullScore = 0.0
+var int   lastCandleBullBar   = na
+var float lastCandleBearScore = 0.0
+var int   lastCandleBearBar   = na
+
+if candleBullFire
+    lastCandleBullScore := candleBullScore
+    lastCandleBullBar   := bar_index
+if candleBearFire
+    lastCandleBearScore := candleBearScore
+    lastCandleBearBar   := bar_index
+
+candleBullScoreWindowed = not na(lastCandleBullBar) and bar_index - lastCandleBullBar <= confirmWindowBars ? lastCandleBullScore : 0.0
+candleBearScoreWindowed = not na(lastCandleBearBar) and bar_index - lastCandleBearBar <= confirmWindowBars ? lastCandleBearScore : 0.0
+
 // =====================================================================
 // DIVERGENCE MODULE
 // price-pivot-anchored: oscillator value read at the confirmed price pivot bar
@@ -288,9 +309,35 @@ if not na(phDiv)
     lastPHrsi := curRsiH
     lastPHhist := curHistH
 
+// Same confirmation-window treatment as the candlestick module: a divergence firing
+// on its pivot bar is almost always several bars before the CHoCH bar it should
+// confirm, so hold it "active" for confirmWindowBars bars. Backward-looking only.
+var float lastDivBullScore = 0.0
+var int   lastDivBullBar   = na
+var float lastDivBearScore = 0.0
+var int   lastDivBearBar   = na
+var int   lastHidBullBar   = na
+var int   lastHidBearBar   = na
+
+if regBullDiv
+    lastDivBullScore := divBullScore
+    lastDivBullBar   := bar_index
+if regBearDiv
+    lastDivBearScore := divBearScore
+    lastDivBearBar   := bar_index
+if hidBullDiv
+    lastHidBullBar := bar_index
+if hidBearDiv
+    lastHidBearBar := bar_index
+
+divBullScoreWindowed = not na(lastDivBullBar) and bar_index - lastDivBullBar <= confirmWindowBars ? lastDivBullScore : 0.0
+divBearScoreWindowed = not na(lastDivBearBar) and bar_index - lastDivBearBar <= confirmWindowBars ? lastDivBearScore : 0.0
+hidBullDivWindowed    = not na(lastHidBullBar) and bar_index - lastHidBullBar <= confirmWindowBars
+hidBearDivWindowed    = not na(lastHidBearBar) and bar_index - lastHidBearBar <= confirmWindowBars
+
 // hidden divergence in the opposite direction of a CHoCH argues against the reversal — heuristic penalty
-hiddenConflictUp   = chochUp and hidBearDiv
-hiddenConflictDown = chochDown and hidBullDiv
+hiddenConflictUp   = chochUp and hidBearDivWindowed
+hiddenConflictDown = chochDown and hidBullDivWindowed
 
 // =====================================================================
 // HTF CONTEXT (heuristic EMA-slope bias — see limitations)
@@ -318,8 +365,8 @@ structureScoreDown = chochDown ? 2.0 : 0.0
 htfAlignUp   = htfBiasCombined > 0 ? wHTF : htfBiasCombined < 0 ? -wHTF : 0.0
 htfAlignDown = htfBiasCombined < 0 ? wHTF : htfBiasCombined > 0 ? -wHTF : 0.0
 
-scoreUp   = structureScoreUp   + candleBullScore * wCandle + divBullScore * wDiverg - (hiddenConflictUp   ? 1.0 : 0.0) + htfAlignUp
-scoreDown = structureScoreDown + candleBearScore * wCandle + divBearScore * wDiverg - (hiddenConflictDown ? 1.0 : 0.0) + htfAlignDown
+scoreUp   = structureScoreUp   + candleBullScoreWindowed * wCandle + divBullScoreWindowed * wDiverg - (hiddenConflictUp   ? 1.0 : 0.0) + htfAlignUp
+scoreDown = structureScoreDown + candleBearScoreWindowed * wCandle + divBearScoreWindowed * wDiverg - (hiddenConflictDown ? 1.0 : 0.0) + htfAlignDown
 
 htfOkUp   = not requireHTFalign or htfBiasCombined >= 0
 htfOkDown = not requireHTFalign or htfBiasCombined <= 0
@@ -352,6 +399,10 @@ plot(candleBullScore, title="Candle Bull Score (feature)", display=display.data_
 plot(candleBearScore, title="Candle Bear Score (feature)", display=display.data_window)
 plot(divBullScore, title="Divergence Bull Score (feature)", display=display.data_window)
 plot(divBearScore, title="Divergence Bear Score (feature)", display=display.data_window)
+plot(candleBullScoreWindowed, title="Candle Bull Score Windowed (feature)", display=display.data_window)
+plot(candleBearScoreWindowed, title="Candle Bear Score Windowed (feature)", display=display.data_window)
+plot(divBullScoreWindowed, title="Divergence Bull Score Windowed (feature)", display=display.data_window)
+plot(divBearScoreWindowed, title="Divergence Bear Score Windowed (feature)", display=display.data_window)
 plot(htfBiasCombined, title="HTF Bias Combined (feature)", display=display.data_window)
 plot(scoreUp, title="Score Up (feature)", display=display.data_window)
 plot(scoreDown, title="Score Down (feature)", display=display.data_window)
