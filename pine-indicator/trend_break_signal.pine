@@ -74,7 +74,13 @@ f_structure(srcHigh, srcLow, srcClose, atrValue, L, R, minATRmult, hold) =>
     var float lastSwingLow  = na
     var string lastHighType = na
     var string lastLowType  = na
-    var string state        = "range"
+    // structClass: raw HH/HL/LH/LL read, can flip freely every bar — informational only,
+    // never gates a signal directly (that was the source of the race described below).
+    var string structClass  = "range"
+    // trendState: the single confirmed source of truth for CHoCH/BOS gating. It only
+    // changes through the confirmation pathway below (immediately when hold<=0, or after
+    // `hold` bars survive when hold>0) — never via a same-bar structural reclassification.
+    var string trendState   = "range"
     var float pendingLevel  = na
     var string pendingDir   = na
     var int pendingBar      = na
@@ -90,7 +96,7 @@ f_structure(srcHigh, srcLow, srcClose, atrValue, L, R, minATRmult, hold) =>
         if noiseOkH
             if not na(lastSwingHigh)
                 lastHighType := ph > lastSwingHigh ? "HH" : "LH"
-                if state == "up" and lastHighType == "HH"
+                if trendState == "up" and lastHighType == "HH"
                     bosUp := true
             lastSwingHigh := ph
 
@@ -99,17 +105,19 @@ f_structure(srcHigh, srcLow, srcClose, atrValue, L, R, minATRmult, hold) =>
         if noiseOkL
             if not na(lastSwingLow)
                 lastLowType := pl < lastSwingLow ? "LL" : "HL"
-                if state == "down" and lastLowType == "LL"
+                if trendState == "down" and lastLowType == "LL"
                     bosDown := true
             lastSwingLow := pl
 
     if lastHighType == "HH" and lastLowType == "HL"
-        state := "up"
+        structClass := "up"
     else if lastHighType == "LH" and lastLowType == "LL"
-        state := "down"
+        structClass := "down"
 
-    chochUpRaw   = state == "down" and not na(lastSwingHigh) and ta.crossover(srcClose, lastSwingHigh)
-    chochDownRaw = state == "up"   and not na(lastSwingLow)  and ta.crossunder(srcClose, lastSwingLow)
+    // Gated on trendState (confirmed), not structClass (raw) — a same-bar reclassification
+    // can no longer bypass hold-bar confirmation the way it previously could.
+    chochUpRaw   = trendState == "down" and not na(lastSwingHigh) and ta.crossover(srcClose, lastSwingHigh)
+    chochDownRaw = trendState == "up"   and not na(lastSwingLow)  and ta.crossunder(srcClose, lastSwingLow)
 
     chochUp   = false
     chochDown = false
@@ -118,10 +126,20 @@ f_structure(srcHigh, srcLow, srcClose, atrValue, L, R, minATRmult, hold) =>
         chochUp   := chochUpRaw
         chochDown := chochDownRaw
         if chochUp
-            state := "up"
+            trendState := "up"
         if chochDown
-            state := "down"
+            trendState := "down"
     else
+        // An opposing raw trigger arriving while a pending confirmation is in flight used
+        // to be silently dropped (the na(pendingDir) guard below would just skip it). Price
+        // closing back through the other structural level is itself evidence the pending
+        // call is wrong, so treat it as an implicit failure: cancel the stale pending and
+        // let the same bar arm a fresh pending in the new direction.
+        if chochUpRaw and pendingDir == "down"
+            pendingDir := na
+        if chochDownRaw and pendingDir == "up"
+            pendingDir := na
+
         if chochUpRaw and na(pendingDir)
             pendingDir := "up"
             pendingLevel := lastSwingHigh
@@ -139,12 +157,12 @@ f_structure(srcHigh, srcLow, srcClose, atrValue, L, R, minATRmult, hold) =>
                 chochUp   := pendingDir == "up"
                 chochDown := pendingDir == "down"
                 if chochUp
-                    state := "up"
+                    trendState := "up"
                 if chochDown
-                    state := "down"
+                    trendState := "down"
                 pendingDir := na
 
-    [state, chochUp, chochDown, bosUp, bosDown, lastSwingHigh, lastSwingLow]
+    [trendState, chochUp, chochDown, bosUp, bosDown, lastSwingHigh, lastSwingLow]
 
 [structState, chochUp, chochDown, bosUp, bosDown, lastSwingHigh, lastSwingLow] =
      f_structure(high, low, close, atrVal, pivotLeft, pivotRight, minSwingATRMult, holdBars)
