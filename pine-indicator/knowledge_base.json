@@ -1,0 +1,305 @@
+{
+  "meta": {
+    "project_name": "Crypto Trend-Break Knowledge Base & Indicator Pipeline",
+    "market": "crypto",
+    "timeframes": ["5m", "15m", "1h"],
+    "goal": "Formalize classical technical-analysis and price-action concepts into codeable rules, features, filters, confirmations, invalidations and heuristics, sufficient to (1) drive a Pine Script v6 trend-break indicator and (2) label a dataset for ML training, without inventing new facts beyond well-established TA concepts.",
+    "assumptions": [
+      "Crypto trades 24/7 with no session gaps, unlike the equities/futures markets most cited sources were originally written for.",
+      "Base execution timeframes are 5m and 15m; 1h is used as higher-timeframe (HTF) context only, not as an independent signal source in this scope.",
+      "All signals are computed from confirmed, closed bars unless a rule is explicitly marked as an intrabar/heuristic early-warning.",
+      "Pivot-based swing detection has an inherent confirmation lag (pivot_right bars) — this is disclosed latency, not repaint.",
+      "No proprietary or invented claims are attributed to the listed authors beyond commonly known, widely published core concepts of their respective methods."
+    ]
+  },
+  "knowledge_base": {
+    "summary": "Core technical-analysis literature converges on a small set of reusable primitives: trend is defined by the sequence of swing highs/lows (Murphy, Wyckoff, Beggs/ICT-style structure); reversals are confirmed by a break of that swing sequence (change of character) rather than by a single indicator; candlestick patterns (Nison) and oscillator divergences (Elder) act as confirming/timing signals, not standalone triggers; volume (Wyckoff) validates or invalidates a move; and higher-timeframe context (Murphy, Elder's triple screen) filters which lower-timeframe signals are worth acting on. Bulkowski's geometric chart patterns are statistically documented but not precisely formalizable without a trained classifier, so they are treated as heuristic filters rather than direct rules.",
+    "books": [
+      {
+        "title": "Technical Analysis of the Financial Markets",
+        "author": "John Murphy",
+        "role_in_project": "Foundational trend, support/resistance, and multi-timeframe-context vocabulary.",
+        "key_concepts": ["trend definition via swing highs/lows", "support/resistance as prior swing levels", "volume as trend confirmation", "multiple timeframe analysis"]
+      },
+      {
+        "title": "Technical Analysis",
+        "author": "Jack Schwager",
+        "role_in_project": "Cross-checks pattern reliability and breakout/failure behavior described by Murphy and Bulkowski.",
+        "key_concepts": ["breakout validity", "false signal filtering", "trend reversal confirmation"]
+      },
+      {
+        "title": "Japanese Candlestick Charting Techniques",
+        "author": "Steve Nison",
+        "role_in_project": "Source for the candlestick reversal pattern module (engulfing, pin bar family, star patterns).",
+        "key_concepts": ["bullish/bearish engulfing", "hammer/hanging man", "morning star/evening star", "pattern reliability depends on prior trend context"]
+      },
+      {
+        "title": "Encyclopedia of Chart Patterns",
+        "author": "Thomas Bulkowski",
+        "role_in_project": "Statistical grounding for pattern reliability; geometric patterns are flagged heuristic_filter rather than direct rules due to formalization difficulty.",
+        "key_concepts": ["breakout/failure statistics", "double top/bottom", "head and shoulders", "pattern reliability varies by market and context"]
+      },
+      {
+        "title": "Trading for a Living",
+        "author": "Alexander Elder",
+        "role_in_project": "Source for the divergence module and higher-timeframe filtering (\"triple screen\") logic.",
+        "key_concepts": ["RSI/MACD divergence as reversal warning", "triple screen multi-timeframe filtering", "volume/oscillator confirmation"]
+      },
+      {
+        "title": "Wyckoff Method",
+        "author": "Richard Wyckoff (tradition)",
+        "role_in_project": "Source for volume-based confirmation and climax-volume reversal heuristics.",
+        "key_concepts": ["effort vs result (volume vs price range)", "climax volume at reversals", "accumulation/distribution context"]
+      },
+      {
+        "title": "Price action, liquidity and false breaks (practitioner tradition)",
+        "author": "Lance Beggs / Tom Alexander",
+        "role_in_project": "Source for change-of-character/break-of-structure vocabulary, retest logic, and false-breakout (liquidity sweep) filtering used in the structure module.",
+        "key_concepts": ["break of structure vs change of character", "retest of broken level", "false breakout / liquidity sweep", "price action without lagging indicators"]
+      }
+    ],
+    "crypto_specific_notes": [
+      "24/7 continuous trading means no opening-gap analysis applies; swing/pivot logic must rely purely on intraday price action.",
+      "Perpetual futures funding-rate dynamics can produce wicks and short-lived false breakouts not explained by classical equity-market TA — treat wick-only breaks with extra skepticism (heuristic).",
+      "Liquidity is fragmented across exchanges; a break confirmed on one venue's feed may not reflect the broader market — data source should be disclosed and consistent.",
+      "Low-cap/altcoin pairs have thinner order books, inflating noise and false-breakout rates relative to BTC/ETH — noise-filter parameters (ATR multiples) likely need per-symbol tuning.",
+      "Volatility clusters around specific hours/sessions (US/Asia overlap, weekend thinning) more than in traditional markets with fixed sessions — a volatility-regime feature is recommended rather than assuming stationarity.",
+      "No circuit breakers or trading halts exist in most crypto venues, so extreme-volatility bars are not filtered by the exchange the way they might be in equities."
+    ]
+  },
+  "agents": {
+    "research_agent": {
+      "rules": [
+        {"topic": "trend", "rule": "Uptrend is defined by a sequence of higher highs and higher lows.", "formalization": "if last_high_type == 'HH' and last_low_type == 'HL': trend = 'up'", "automation_level": "direct", "ml_usefulness": "high", "features": ["trend_state"]},
+        {"topic": "trend", "rule": "Downtrend is defined by a sequence of lower highs and lower lows.", "formalization": "if last_high_type == 'LH' and last_low_type == 'LL': trend = 'down'", "automation_level": "direct", "ml_usefulness": "high", "features": ["trend_state"]},
+        {"topic": "change_of_character", "rule": "A change of character occurs when price closes beyond the most recent swing point against the current trend.", "formalization": "if trend == 'up' and close < last_swing_low: choch_down = true", "automation_level": "direct", "ml_usefulness": "high", "features": ["choch_up", "choch_down", "bars_since_last_choch"]},
+        {"topic": "break_of_structure", "rule": "A break of structure occurs when price closes beyond the most recent swing point in the direction of the current trend, confirming continuation.", "formalization": "if trend == 'up' and close > last_swing_high: bos_up = true", "automation_level": "direct", "ml_usefulness": "medium", "features": ["bos_up", "bos_down"]},
+        {"topic": "retest", "rule": "After a break, price often returns to the broken level before continuing; a held retest strengthens the signal.", "formalization": "if bars_since(break) <= N and abs(close - level) <= k*ATR and subsequent close moves away from level: retest_hold = true", "automation_level": "heuristic", "ml_usefulness": "medium", "features": ["retest_hold", "bars_to_retest"]},
+        {"topic": "false_breakout", "rule": "A false breakout occurs when price pierces a level intrabar (wick) but closes back on the original side within a short window.", "formalization": "if wick_beyond_level and close_back_inside(within M bars): false_breakout = true", "automation_level": "direct", "ml_usefulness": "high", "features": ["false_breakout_flag"]},
+        {"topic": "candlestick", "rule": "A bullish/bearish engulfing candle's body fully covers the prior candle's opposite-direction body.", "formalization": "close>open and close[1]<open[1] and close>=open[1] and open<=close[1] and body>=body[1]*ratio", "automation_level": "direct", "ml_usefulness": "high", "features": ["candle_pattern_onehot", "candle_score"]},
+        {"topic": "candlestick", "rule": "A pin bar / hammer / hanging man has a small body and a long wick at least k times the body on one side.", "formalization": "wick >= body*k and opposite_wick <= body", "automation_level": "direct", "ml_usefulness": "high", "features": ["candle_pattern_onehot", "candle_score"]},
+        {"topic": "candlestick", "rule": "Morning/evening star is a three-candle reversal: strong trend candle, small-body indecision candle, strong opposite candle closing beyond the midpoint of the first.", "formalization": "trend_candle then small_body_candle (body <= range*ratio) then reversal_candle closing past midpoint of candle 1", "automation_level": "direct", "ml_usefulness": "medium", "features": ["candle_pattern_onehot", "candle_score"]},
+        {"topic": "candlestick", "rule": "Pattern strength increases when it occurs at a structural level and/or with above-average volume.", "formalization": "score += level_proximity_bonus + volume_spike_bonus", "automation_level": "direct", "ml_usefulness": "high", "features": ["candle_score"]},
+        {"topic": "divergence", "rule": "Regular bullish divergence: price makes a lower pivot low while the oscillator makes a higher pivot low.", "formalization": "if price_pivot < prev_price_pivot and osc_value_at_pivot > osc_value_at_prev_pivot: regular_bullish_div = true", "automation_level": "direct", "ml_usefulness": "high", "features": ["divergence_type_onehot", "divergence_strength"]},
+        {"topic": "divergence", "rule": "Regular bearish divergence: price makes a higher pivot high while the oscillator makes a lower pivot high.", "formalization": "if price_pivot > prev_price_pivot and osc_value_at_pivot < osc_value_at_prev_pivot: regular_bearish_div = true", "automation_level": "direct", "ml_usefulness": "high", "features": ["divergence_type_onehot", "divergence_strength"]},
+        {"topic": "divergence", "rule": "Hidden divergence (price/oscillator mismatch in the opposite pattern) suggests trend continuation rather than reversal.", "formalization": "mirror of regular divergence conditions with price/oscillator roles swapped", "automation_level": "direct", "ml_usefulness": "medium", "features": ["divergence_type_onehot", "hidden_divergence_flag"]},
+        {"topic": "volume", "rule": "Volume above its recent average confirms the significance of a breakout or pattern.", "formalization": "volume >= SMA(volume, 20) * mult", "automation_level": "direct", "ml_usefulness": "high", "features": ["volume_rel_sma20", "volume_zscore"]},
+        {"topic": "volume", "rule": "Climax volume (Wyckoff) — an unusually large volume spike at a price extreme can mark exhaustion and reversal.", "formalization": "volume >= SMA(volume,20)*mult2 and range >= k*ATR at a local price extreme", "automation_level": "heuristic", "ml_usefulness": "medium", "features": ["climax_volume_flag"]},
+        {"topic": "noise_filter", "rule": "Swings smaller than a volatility-scaled minimum size should be discarded as noise before classification.", "formalization": "if abs(pivot - prev_pivot) < ATR * min_mult: ignore_pivot", "automation_level": "direct", "ml_usefulness": "high", "features": ["swing_size_atr_normalized"]},
+        {"topic": "higher_timeframe_context", "rule": "Higher-timeframe trend/bias should filter or weight lower-timeframe signals rather than trigger signals on its own.", "formalization": "htf_bias in {up, down, neutral} used as a scoring weight, not a standalone trigger", "automation_level": "filter_only", "ml_usefulness": "high", "features": ["htf_bias"]},
+        {"topic": "chart_patterns", "rule": "Classical geometric reversal patterns (double top/bottom, head and shoulders) are statistically documented but geometrically ambiguous to define precisely.", "formalization": "not precisely codeable without a trained geometric-pattern classifier", "automation_level": "heuristic", "ml_usefulness": "medium", "features": ["chart_pattern_heuristic_score"]},
+        {"topic": "chart_patterns", "rule": "A false breakout of a geometric chart-pattern level (return inside after piercing) weakens the pattern's validity.", "formalization": "requires arbitrary level definition from the geometric pattern; not precisely codeable", "automation_level": "heuristic", "ml_usefulness": "low", "features": ["chart_pattern_false_breakout_flag"]},
+        {"topic": "divergence", "rule": "OBV divergence against price can add confirmation but OBV is unbounded, unlike RSI/MACD, making zone-based quality filters unreliable.", "formalization": "obv_pivot vs price_pivot mismatch, used only as an auxiliary confluence flag", "automation_level": "filter_only", "ml_usefulness": "medium", "features": ["obv_divergence_flag"]}
+      ],
+      "candidate_features": [
+        "trend_state", "bars_since_last_choch", "bars_since_last_bos", "dist_to_last_swing_high_pct", "dist_to_last_swing_low_pct",
+        "candle_body_ratio", "upper_wick_ratio", "lower_wick_ratio", "candle_pattern_onehot", "candle_score",
+        "rsi", "rsi_slope", "macd_hist", "macd_hist_slope", "divergence_type_onehot", "divergence_strength",
+        "volume_rel_sma20", "volume_zscore", "climax_volume_flag", "htf1_bias", "htf2_bias",
+        "atr_normalized_range", "swing_size_atr_normalized", "score_up", "score_down", "signal_mode"
+      ],
+      "candidate_labels": [
+        "future_return_n_bars", "max_favorable_excursion", "max_adverse_excursion",
+        "manual_trend_break_confirmed", "false_breakout_label", "retest_hold_label", "volatility_regime_label"
+      ]
+    },
+    "market_structure_agent": {
+      "definitions": {
+        "HH": "A confirmed swing high with a value greater than the previous confirmed swing high.",
+        "HL": "A confirmed swing low with a value greater than the previous confirmed swing low.",
+        "LH": "A confirmed swing high with a value less than the previous confirmed swing high.",
+        "LL": "A confirmed swing low with a value less than the previous confirmed swing low.",
+        "break_of_structure": "Price closes beyond the most recent swing point in the direction of the prevailing trend, confirming continuation.",
+        "change_of_character": "Price closes beyond the most recent swing point against the prevailing trend, signaling a possible reversal (the primary trend_break trigger).",
+        "retest": "After a change of character, price returns to within a tolerance band of the broken level and then closes away from it in the direction of the break, strengthening confirmation.",
+        "false_breakout": "Price closes back on the original side of a broken level within a short bar window after the break, invalidating it."
+      },
+      "swing_detection": {
+        "method": "Confirmed pivot high/low: a bar's high(low) is the maximum(minimum) within a symmetric window of pivot_left bars before and pivot_right bars after it; confirmation is inherently delayed by pivot_right bars, which is disclosed latency, not repaint. A volatility-scaled noise filter discards pivots too close to the prior opposite-type pivot.",
+        "parameters": {
+          "pivot_left": 5,
+          "pivot_right": 5,
+          "min_swing_distance": 0.5,
+          "noise_filter": "A new pivot is accepted only if abs(new_pivot - last_accepted_opposite_type_pivot) >= ATR(atr_len) * min_swing_distance; min_swing_distance is expressed as a multiple of ATR."
+        }
+      },
+      "trend_state_machine": {
+        "states": ["uptrend", "downtrend", "range", "transition"],
+        "transition_rules": [
+          "range -> uptrend: first confirmed HH+HL pair forms.",
+          "range -> downtrend: first confirmed LH+LL pair forms.",
+          "uptrend -> transition: close crosses below the last confirmed swing low (raw change-of-character trigger) while awaiting hold-bar confirmation.",
+          "downtrend -> transition: close crosses above the last confirmed swing high (raw change-of-character trigger) while awaiting hold-bar confirmation.",
+          "transition -> downtrend: the pending change-of-character survives the configured confirmation window without price closing back through the broken level.",
+          "transition -> uptrend: symmetric case for a bullish change-of-character surviving confirmation.",
+          "transition -> previous state: price closes back through the broken level before the confirmation window elapses (false-breakout invalidation).",
+          "an opposing raw trigger arriving during transition cancels the pending state (treated as evidence against it) and immediately arms a new transition in the opposing direction."
+        ]
+      },
+      "trend_break_rules": {
+        "trend_break_up": "Confirmed when trend_state was 'downtrend' (or 'transition' toward up), price closes above the last confirmed swing high, and the change-of-character survives the configured hold-bar confirmation window (0 bars = immediate).",
+        "trend_break_down": "Confirmed when trend_state was 'uptrend' (or 'transition' toward down), price closes below the last confirmed swing low, and the change-of-character survives the configured hold-bar confirmation window (0 bars = immediate)."
+      },
+      "pseudo_code": [
+        "ph = confirmed_pivot_high(high, pivot_left, pivot_right); pl = confirmed_pivot_low(low, pivot_left, pivot_right)",
+        "if ph is new and abs(ph - last_swing_high) >= ATR*min_swing_distance: classify HH/LH vs last_swing_high; last_swing_high = ph",
+        "if pl is new and abs(pl - last_swing_low) >= ATR*min_swing_distance: classify HL/LL vs last_swing_low; last_swing_low = pl",
+        "trend_state updates ONLY through the confirmation pathway below, never directly from HH/HL/LH/LL classification alone",
+        "choch_up_raw = trend_state=='downtrend' and close crosses above last_swing_high",
+        "choch_down_raw = trend_state=='uptrend' and close crosses below last_swing_low",
+        "if hold_bars <= 0: confirm immediately on choch_*_raw",
+        "else: enter 'transition', track bars_since_trigger; cancel if price closes back through the level before hold_bars elapse; confirm and update trend_state if it survives",
+        "bos_up/bos_down are computed the same way but in the direction of the existing trend_state, and are treated as continuation context, not as a trend_break trigger"
+      ]
+    },
+    "candlestick_agent": {
+      "patterns": [
+        {"name": "bullish_engulfing", "direction": "bullish", "conditions": ["close>open", "close[1]<open[1]", "current body fully covers previous body", "body >= body[1]*min_ratio"], "context_requirements": ["stronger after a preceding decline or near a swing low"], "strength_score_hint": "base 2; +1 near structural level; +1 on volume spike", "timeframe_preference": ["15m", "1h"]},
+        {"name": "bearish_engulfing", "direction": "bearish", "conditions": ["close<open", "close[1]>open[1]", "current body fully covers previous body", "body >= body[1]*min_ratio"], "context_requirements": ["stronger after a preceding advance or near a swing high"], "strength_score_hint": "base 2; +1 near structural level; +1 on volume spike", "timeframe_preference": ["15m", "1h"]},
+        {"name": "pin_bar_rejection", "direction": "neutral", "conditions": ["one wick >= k*body", "opposite wick <= body", "small body relative to range"], "context_requirements": ["direction determined by which side the long wick is on", "needs a nearby level to be meaningful, especially on 5m"], "strength_score_hint": "base 1-2; +1 near structural level; +1 on volume spike", "timeframe_preference": ["5m", "15m", "1h"]},
+        {"name": "hammer", "direction": "bullish", "conditions": ["pin_bar_rejection shape with lower wick dominant"], "context_requirements": ["must occur after a preceding decline (context distinguishes it from a generic bullish pin bar)"], "strength_score_hint": "base 2; +1 near structural level; +1 on volume spike", "timeframe_preference": ["15m", "1h"]},
+        {"name": "hanging_man", "direction": "bearish", "conditions": ["pin_bar_rejection shape with lower wick dominant"], "context_requirements": ["must occur after a preceding advance (context distinguishes it from a generic bullish-shaped pin bar)"], "strength_score_hint": "base 2; +1 near structural level; +1 on volume spike", "timeframe_preference": ["15m", "1h"]},
+        {"name": "morning_star", "direction": "bullish", "conditions": ["candle[2] bearish", "candle[1] small body (<= range*max_ratio)", "candle[0] bullish, closing past midpoint of candle[2]"], "context_requirements": ["stronger near a swing low or structural support"], "strength_score_hint": "base 3; +1 near structural level; +1 on volume spike", "timeframe_preference": ["15m", "1h"]},
+        {"name": "evening_star", "direction": "bearish", "conditions": ["candle[2] bullish", "candle[1] small body (<= range*max_ratio)", "candle[0] bearish, closing past midpoint of candle[2]"], "context_requirements": ["stronger near a swing high or structural resistance"], "strength_score_hint": "base 3; +1 near structural level; +1 on volume spike", "timeframe_preference": ["15m", "1h"]}
+      ],
+      "scoring_rules": [
+        "score = base_strength(pattern) + (near_structural_level ? +1 : 0) + (volume >= SMA(volume,20)*spike_mult ? +1 : 0)",
+        "score -= 1 in strict mode if the pattern direction conflicts with higher-timeframe bias",
+        "on 5m, patterns without a volume-spike confirmation should be weighted down or treated as heuristic due to noise"
+      ],
+      "pseudo_code": [
+        "body = abs(close-open); range_ = high-low; upper_wick = high - max(close,open); lower_wick = min(close,open) - low",
+        "bull_engulf = close>open and close[1]<open[1] and close>=open[1] and open<=close[1] and body>=body[1]*min_ratio",
+        "pin_bull_shape = lower_wick >= body*k and upper_wick<=body and close>open",
+        "hammer = pin_bull_shape and prior_move_down; hanging_man = pin_bear_shape and prior_move_up",
+        "morning_star = bearish(candle[2]) and small_body(candle[1]) and bullish(candle[0]) and close > midpoint(open[2],close[2])",
+        "score computed via scoring_rules above, then held active for a short confirmation window so it can still contribute when a structure break lands a few bars later"
+      ]
+    },
+    "divergence_agent": {
+      "oscillators": ["RSI", "MACD", "OBV"],
+      "divergence_types": [
+        {"name": "regular_bullish", "price_condition": "new confirmed pivot low lower than the previous confirmed pivot low", "oscillator_condition": "oscillator value at the new pivot is higher than at the previous pivot", "pivot_rules": "evaluated at the bar of the confirmed price pivot, using the oscillator's value at that same bar rather than an independently-detected oscillator pivot, for reliability", "lookback_rules": "gap between compared pivots must fall within [min_bars, max_bars]; price change between pivots must exceed a minimum percentage", "quality_filters": ["RSI and MACD histogram agreement (confluence bonus)", "RSI below an oversold-ish zone at the pivot", "gap not too close to the minimum bar distance (avoids noisy signals)"], "strength_score_hint": "base 1; +1 confluence; +1 strong price/oscillator change magnitude; +1 RSI extreme zone; -1 if gap near minimum"},
+        {"name": "regular_bearish", "price_condition": "new confirmed pivot high higher than the previous confirmed pivot high", "oscillator_condition": "oscillator value at the new pivot is lower than at the previous pivot", "pivot_rules": "same price-pivot-anchored approach as regular_bullish, mirrored", "lookback_rules": "same bounds as regular_bullish", "quality_filters": ["RSI and MACD histogram agreement", "RSI above an overbought-ish zone at the pivot", "gap not too close to the minimum bar distance"], "strength_score_hint": "base 1; +1 confluence; +1 strong magnitude; +1 RSI extreme zone; -1 if gap near minimum"},
+        {"name": "hidden_bullish", "price_condition": "new confirmed pivot low higher than the previous confirmed pivot low", "oscillator_condition": "oscillator value at the new pivot is lower than at the previous pivot", "pivot_rules": "same price-pivot-anchored approach", "lookback_rules": "same bounds as regular divergences", "quality_filters": ["primarily used as a continuation signal / conflict flag against an opposing change-of-character rather than scored as an independent reversal trigger"], "strength_score_hint": "not scored toward reversal; used to penalize a conflicting trend_break signal in the opposite direction"},
+        {"name": "hidden_bearish", "price_condition": "new confirmed pivot high lower than the previous confirmed pivot high", "oscillator_condition": "oscillator value at the new pivot is higher than at the previous pivot", "pivot_rules": "same price-pivot-anchored approach", "lookback_rules": "same bounds as regular divergences", "quality_filters": ["same continuation/conflict-flag role as hidden_bullish, mirrored"], "strength_score_hint": "not scored toward reversal; used to penalize a conflicting trend_break signal in the opposite direction"}
+      ],
+      "pseudo_code": [
+        "on a confirmed price pivot low at bar B with price P: if a previous pivot low exists, compute gap_bars and price_change_pct",
+        "if gap_bars within [min_bars, max_bars] and price_change_pct >= min_price_change_pct: compare P and oscillator(B) to the previous pivot's price and oscillator value to classify regular_bullish vs hidden_bullish",
+        "mirror the same logic for confirmed price pivot highs to classify regular_bearish vs hidden_bearish",
+        "store each new pivot's bar/price/RSI/MACD-hist as the new comparison baseline",
+        "OBV divergence is computed the same way but only ever contributes as an auxiliary confluence flag, never as a primary trigger, because OBV is unbounded and has no reliable zone-based quality filter"
+      ]
+    },
+    "indicator_builder_agent": {
+      "architecture": {
+        "modules": [
+          {"name": "TrendModule", "responsibility": "Provide a lightweight higher-timeframe directional bias as context, independent of the lower-timeframe structure engine.", "inputs": ["HTF close via multi-timeframe data request", "EMA fast/slow lengths"], "outputs": ["htf_bias per configured higher timeframe", "combined htf_bias"]},
+          {"name": "StructureModule", "responsibility": "Detect swing highs/lows, classify HH/HL/LH/LL, track confirmed trend state, and detect change-of-character (trend_break trigger) and break-of-structure (continuation context), with optional hold-bar confirmation to reduce false breakouts.", "inputs": ["OHLC", "ATR", "pivot left/right bars", "noise-filter multiplier", "hold-bar count"], "outputs": ["trend_state", "choch_up/choch_down", "bos_up/bos_down", "last_swing_high/last_swing_low"]},
+          {"name": "CandlestickModule", "responsibility": "Detect confirming/reversal candlestick patterns and score them by pattern strength, level proximity, and volume.", "inputs": ["OHLCV", "last_swing_high/last_swing_low from StructureModule", "pattern shape parameters"], "outputs": ["candle_bull_score", "candle_bear_score"]},
+          {"name": "DivergenceModule", "responsibility": "Detect regular and hidden RSI/MACD-histogram divergence anchored to confirmed price pivots, and score regular divergences while flagging hidden divergences as conflict signals.", "inputs": ["RSI", "MACD histogram", "confirmed price pivots", "lookback bounds", "quality-filter thresholds"], "outputs": ["div_bull_score", "div_bear_score", "hidden_conflict_up/down"]},
+          {"name": "SignalScoringModule", "responsibility": "Combine structure, candlestick, divergence, and HTF-bias outputs into a weighted score per direction, apply mode-dependent thresholds, and emit the final classification.", "inputs": ["all upstream module outputs", "per-component weights", "signal mode (strict/balanced/aggressive)", "confirmation-window length so component scores survive to the change-of-character bar"], "outputs": ["trend_break_up", "trend_break_down", "neutral", "score_up", "score_down"]}
+        ],
+        "signal_model": {
+          "final_signals": ["trend_break_up", "trend_break_down", "neutral"],
+          "scoring_model": "score_direction = structure_base_score + candle_score*w_candle + divergence_score*w_divergence - hidden_conflict_penalty + htf_alignment*w_htf; a trend_break signal requires both a structure change-of-character trigger AND score_direction >= mode_threshold; component scores are held active for a configurable confirmation window (not reset every bar) so they can still contribute once the change-of-character bar arrives.",
+          "modes": ["strict", "balanced", "aggressive"]
+        }
+      },
+      "pine_script_requirements": [
+        "//@version=6 header; overlay indicator",
+        "input.* for all tunable parameters (pivot bars, ATR multiples, weights, thresholds, HTF timeframes, mode selector)",
+        "ta.pivothigh/ta.pivotlow (or equivalent) for swing detection with inherent, disclosed confirmation lag",
+        "request.security with lookahead=barmerge.lookahead_off for HTF context; any oscillator/EMA computed on the HTF series must be computed inside the request.security expression itself, not on the raw fetched series afterward, to avoid distorting the effective smoothing length",
+        "tuple destructuring for multi-value user-defined functions ([a,b,c] = f(...))",
+        "var-scoped persistent state inside user-defined functions for stateful modules (structure/hold-bar confirmation, divergence pivot tracking)",
+        "plotshape/label for signal markers, alertcondition for alerts, table.* for an on-chart score/state panel",
+        "hidden data-window plots (display.data_window) exposing raw feature/score series for dataset export"
+      ],
+      "anti_repaint_notes": [
+        "Pivot confirmation lag (pivot_right bars) is disclosed latency inherent to any swing-based method, not repaint — a plotted pivot never moves once printed.",
+        "The final trend_break signal is computed only from confirmed bar-close values and already-confirmed pivots/scores — no negative-offset or centered-window lookups are used.",
+        "HTF context values can change intrabar until the HTF bar itself closes — standard multi-timeframe behavior, not a repaint of already-plotted signals.",
+        "Hold-bar confirmation delays when a signal is plotted but is strictly backward-looking (only reads already-known bar indices) — it never revises a signal already drawn on a historical bar.",
+        "An opposing raw trigger arriving while a hold-bar confirmation is pending is treated as an explicit cancellation-and-restart, not a silent drop, to avoid a state-machine race that could otherwise produce an inconsistent signal history."
+      ],
+      "qa_checks": [
+        "Verify HTF EMA (or any HTF oscillator) is computed inside the request.security() call, not on a locally re-smoothed staircase of already-fetched HTF values.",
+        "Verify the confirmed trend_state used to gate change-of-character/break-of-structure detection cannot be altered by a same-bar raw HH/HL/LH/LL reclassification while a hold-bar confirmation is pending.",
+        "Verify candlestick/divergence component scores are held active for a defined confirmation window rather than resetting to zero on every bar that doesn't fire a pattern, since a divergence pivot and a structure break rarely land on the exact same bar.",
+        "Verify higher-timeframe inputs are meaningfully above the chart's own timeframe (auto-scaled or explicitly validated), rather than silently defaulting to a fixed timeframe that stops being 'higher' once the chart itself is opened on 15m or 1h.",
+        "Compile in the actual Pine Editor to confirm simple-int parameter passing through user-defined functions into pivot/security calls, and confirm tuple-destructuring / line-continuation syntax, before relying on the script.",
+        "Backtest with realistic fees/slippage, check explicitly for lookahead bias, overfitting to the backtest sample, and low trade-count statistical noise before treating any performance number as validation."
+      ]
+    }
+  },
+  "ml_dataset_blueprint": {
+    "required_data": ["OHLCV"],
+    "labels": [
+      "trend_labels",
+      "breakout_labels",
+      "retest_labels",
+      "divergence_labels",
+      "candle_pattern_labels",
+      "higher_timeframe_context",
+      "false_breakout_labels",
+      "volatility_regime_labels",
+      "outcome_labels"
+    ],
+    "feature_groups": [
+      "market_structure",
+      "candlestick_patterns",
+      "oscillators",
+      "volume",
+      "higher_timeframe_context",
+      "volatility"
+    ],
+    "target_horizons": ["5m", "15m", "1h"],
+    "notes": [
+      "Outcome/label definition (e.g. forward N-bar return, max favorable/adverse excursion, or manually reviewed trend-break confirmation) belongs to the ML pipeline, not the indicator itself — the indicator only exposes confirmed, timestamped feature/score series.",
+      "True change-of-character events are rare relative to neutral bars, so expect significant class imbalance in any trend_break label; stratified sampling or class weighting is likely necessary.",
+      "Forward-return-based outcome labels should account for realistic execution assumptions (fees, slippage, achievable fill price) rather than raw close-to-close return, or the label will overstate what a strategy could actually capture.",
+      "Feature values used to build a label must be limited to information available at or before the labeled bar's close, to avoid label leakage from the same lookahead-avoidance discipline the indicator itself follows.",
+      "Volatility regime can be operationalized as an ATR percentile or realized-volatility bucket relative to a rolling lookback window, since crypto volatility is not stationary across sessions.",
+      "False-breakout labels require a short forward-looking confirmation window (e.g. does price close back through the level within M bars) and must be computed only once that window has actually elapsed, to remain leakage-free at labeling time."
+    ]
+  },
+  "risks_and_limitations": {
+    "overfitting_risks": [
+      "Mode thresholds (strict/balanced/aggressive) and component weights are initial estimates, not calibrated against historical data — tuning them on the same sample later used to report performance would be in-sample overfitting.",
+      "Low trade/event count on 1h in particular makes any performance statistic (win rate, Sharpe-like ratios) highly sensitive to noise unless a sufficiently long and diverse sample is used.",
+      "Geometric chart-pattern heuristics (Bulkowski-style) and climax-volume thresholds are inherently loosely defined and especially prone to being tuned to fit a specific backtest window rather than generalizing."
+    ],
+    "repaint_risks": [
+      "None identified as true repaint (a plotted historical signal changing after the fact) in the current design, based on static review — this has not yet been confirmed by an actual multi-session live/replay test in the Pine Editor.",
+      "Pivot confirmation lag and hold-bar confirmation delay are disclosed latency, not repaint, but should still be clearly communicated to any user relying on the indicator for manual trading.",
+      "HTF context values can shift intrabar until the higher-timeframe bar closes — normal multi-timeframe behavior, but could be mistaken for repaint if not understood."
+    ],
+    "crypto_noise_risks": [
+      "Thin liquidity on altcoin pairs can produce swing points and breakouts that don't reflect genuine structural shifts, inflating false-breakout and false-signal rates relative to BTC/ETH.",
+      "Funding-rate-driven wicks on perpetual futures can trigger false-breakout or pin-bar detections unrelated to classical price-action causes.",
+      "Fragmented liquidity across exchanges means the same nominal price level can behave differently depending on the data source used.",
+      "Non-stationary volatility (session-dependent, weekend thinning) means a single fixed ATR-multiple noise filter may not generalize across time or across symbols without periodic recalibration."
+    ],
+    "implementation_limits": [
+      "The current Pine Script implementation has not yet been compiled in the TradingView Pine Editor; syntax risk remains around simple-int parameter passing into pivot/security functions and tuple-destructuring line continuation.",
+      "Retest and false-breakout handling is simplified to a single hold-bar confirmation window rather than a full wick-tracking, multi-stage retest state machine.",
+      "OBV divergence and Bulkowski-style geometric chart patterns are documented as heuristic filters only and are not implemented as scored detectors in the current codebase.",
+      "The candlestick/divergence confirmation window is a fixed bar count rather than an adaptive one, and has not yet been calibrated against real data."
+    ]
+  },
+  "execution_plan": {
+    "step_1": "Compile the Pine Script v6 indicator in the TradingView Pine Editor and resolve any syntax errors, with particular attention to simple-int parameters passed into pivot/security calls and tuple-destructuring line continuations.",
+    "step_2": "Run manual/visual QA on live and historical charts across 5m/15m/1h for multiple crypto pairs (at minimum BTC and one lower-liquidity altcoin) to sanity-check signal frequency and obvious false positives.",
+    "step_3": "Run a quantitative backtest with realistic fees and slippage across all three signal modes, explicitly checking for lookahead bias, survivorship bias, and overfitting, and reporting metrics with sample-size and in-sample/out-of-sample caveats attached.",
+    "step_4": "Build the dataset export pipeline that pulls the indicator's exposed feature/score series and applies the label definitions in ml_dataset_blueprint under a leakage-free labeling discipline.",
+    "step_5": "Calibrate thresholds, weights, and confirmation-window length via walk-forward validation on the labeled dataset before relying on the indicator for either live manual trading or as a trusted labeling source for model training."
+  },
+  "output_rules": {
+    "must_be_valid_json": true,
+    "no_markdown": true,
+    "no_explanatory_text_outside_json": true,
+    "if_information_is_missing": "use null or empty arrays, never invent facts"
+  }
+}

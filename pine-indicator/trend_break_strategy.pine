@@ -1,0 +1,574 @@
+//@version=6
+strategy("Trend Break Strategy — Crypto MTF (Structure + Candles + Divergence)", shorttitle="TBS-Strat", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=1, pyramiding=0, calc_on_every_tick=false, process_orders_on_close=false,
+     max_labels_count=500, max_lines_count=500)
+// Initial capital / commission / slippage above are starting defaults only — override them
+// anytime from the Strategy Tester's "Properties" tab in TradingView without editing code.
+// process_orders_on_close=false: orders fill on the NEXT bar's open, not the signal bar's
+// close, so the same closed bar is never used both to generate and to fill a signal.
+
+// =====================================================================
+// SAME SIGNAL ENGINE AS trend_break_signal.pine (Structure + Candles + Divergence + HTF)
+// See that file's commit history for the QA fixes already applied here:
+// HTF EMA computed inside request.security, confirmation-window scoring,
+// hold-bars race fix (structClass vs trendState split), HTF auto-scaling.
+// =====================================================================
+
+// =====================================================================
+// INPUTS
+// =====================================================================
+grpStruct = "Market Structure"
+pivotLeft        = input.int(5, "Pivot Left Bars", group=grpStruct, minval=1)
+pivotRight       = input.int(5, "Pivot Right Bars", group=grpStruct, minval=1)
+atrLen           = input.int(14, "ATR Length (noise filter)", group=grpStruct)
+minSwingATRMult  = input.float(0.5, "Min Swing Size (x ATR)", group=grpStruct, minval=0)
+holdBars         = input.int(0, "Break Confirmation Hold Bars (0 = off)", group=grpStruct, minval=0,
+     tooltip="If > 0, delays a CHoCH signal by N bars and cancels it if price closes back through the broken level before N bars pass. Reduces false breakouts at the cost of later signals. Never repaints an already-plotted signal.")
+
+grpCandle = "Candlestick Patterns"
+pinWickMult        = input.float(2.0, "Pin Bar Wick/Body Multiplier", group=grpCandle, minval=1.0)
+engulfMinBodyRatio = input.float(1.0, "Engulfing Min Body Ratio", group=grpCandle, minval=0.1)
+starBodyMaxRatio   = input.float(0.3, "Star Middle Candle Max Body/Range", group=grpCandle, minval=0.05, maxval=1.0)
+volSpikeMult       = input.float(1.5, "Volume Spike Multiplier (x SMA20)", group=grpCandle, minval=1.0)
+levelProxATRmult   = input.float(0.5, "Level Proximity (x ATR)", group=grpCandle, minval=0.1)
+priorMoveLookback  = input.int(3, "Prior Move Context Lookback (bars)", group=grpCandle, minval=1)
+
+grpDiv = "Divergence"
+rsiLen             = input.int(14, "RSI Length", group=grpDiv)
+macdFast           = input.int(12, "MACD Fast", group=grpDiv)
+macdSlow           = input.int(26, "MACD Slow", group=grpDiv)
+macdSignalLen      = input.int(9, "MACD Signal", group=grpDiv)
+divMinBars         = input.int(5, "Divergence Min Bars Between Pivots", group=grpDiv, minval=1)
+divMaxBars         = input.int(60, "Divergence Max Bars Between Pivots", group=grpDiv, minval=2)
+divMinPriceChgPct  = input.float(0.1, "Divergence Min Price Change %", group=grpDiv, minval=0.0)
+rsiOversoldZone    = input.float(40.0, "RSI Zone Bonus: Bullish below", group=grpDiv)
+rsiOverboughtZone  = input.float(60.0, "RSI Zone Bonus: Bearish above", group=grpDiv)
+
+grpHTF = "Higher Timeframe Context (heuristic bias, not full structure)"
+useHTF        = input.bool(true, "Use HTF Context", group=grpHTF)
+htfAutoScale  = input.bool(true, "Auto-scale HTF to chart timeframe", group=grpHTF,
+     tooltip="On: HTF #1/#2 are computed as multiples of the chart's own timeframe (e.g. on a 5m chart, x3/x12 give 15m/60m — the original fixed defaults). Off: use the fixed HTF #1/#2 fields below regardless of chart timeframe, which stop being a 'higher' context if the chart is opened above them (e.g. fixed 15m/60m on a 1h chart).")
+htf1Mult      = input.int(3, "HTF #1 Multiplier (x chart TF)", group=grpHTF, minval=2)
+htf2Mult      = input.int(12, "HTF #2 Multiplier (x chart TF)", group=grpHTF, minval=2)
+htf1          = input.timeframe("15", "HTF #1 (used when auto-scale is off)", group=grpHTF)
+htf2          = input.timeframe("60", "HTF #2 (used when auto-scale is off)", group=grpHTF)
+htfEmaFastLen = input.int(20, "HTF EMA Fast", group=grpHTF)
+htfEmaSlowLen = input.int(50, "HTF EMA Slow", group=grpHTF)
+
+grpScore = "Scoring / Mode"
+modeInput = input.string("Balanced", "Signal Mode", options=["Strict", "Balanced", "Aggressive"], group=grpScore)
+wCandle  = input.float(1.0, "Candlestick Weight", group=grpScore)
+wDiverg  = input.float(1.5, "Divergence Weight", group=grpScore)
+wHTF     = input.float(1.0, "HTF Alignment Weight", group=grpScore)
+confirmWindowBars = input.int(8, "Confirmation Window (bars)", group=grpScore, minval=0,
+     tooltip="How many bars a candlestick/divergence score stays 'active' after firing, so it can still confirm a CHoCH that lands a few bars later. 0 = only same-bar confluence counts (score effectively resets every bar). Backward-looking only — never repaints.")
+
+grpRisk = "Risk Management"
+allowLong  = input.bool(true, "Allow Long", group=grpRisk)
+allowShort = input.bool(true, "Allow Short", group=grpRisk)
+riskPctPerTrade = input.float(1.0, "Risk % of Equity per Trade", group=grpRisk, minval=0.01, maxval=100,
+     tooltip="Position size is derived from this risk and the ATR stop distance: qty = (equity * risk%) / stop_distance. Not a fraction of equity invested — a fraction of equity risked if the stop is hit.")
+atrStopLen  = input.int(14, "ATR Stop Length", group=grpRisk, minval=1)
+atrStopMult = input.float(2.0, "ATR Stop Multiplier", group=grpRisk, minval=0.1)
+rrMultiple  = input.float(2.0, "Take Profit R:R Multiple", group=grpRisk, minval=0.1,
+     tooltip="Take profit distance = R:R multiple x stop distance, measured from the same approximate entry price used to size the stop.")
+flipOnOppositeSignal = input.bool(true, "Flip Position on Opposite Signal", group=grpRisk,
+     tooltip="On: a confirmed opposite-direction signal closes the current position and opens the new one immediately. Off: the current position only exits via its stop/take-profit bracket, and a new position is only opened once flat.")
+
+grpDisp = "Display"
+showMarkers   = input.bool(true, "Show Signal Markers", group=grpDisp)
+showStructure = input.bool(true, "Show Structure Lines", group=grpDisp)
+showScorePanel = input.bool(true, "Show Score Table", group=grpDisp)
+
+// =====================================================================
+// SHARED SERIES
+// =====================================================================
+atrVal   = ta.atr(atrLen)
+volSma20 = ta.sma(volume, 20)
+rsiVal   = ta.rsi(close, rsiLen)
+[macdLine, macdSignalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+
+// mode thresholds — initial values, calibrate via backtest before production use
+thresholdUp   = modeInput == "Strict" ? 5.0 : modeInput == "Balanced" ? 3.5 : 2.0
+thresholdDown = thresholdUp
+requireHTFalign = modeInput == "Strict"
+
+// =====================================================================
+// STRUCTURE MODULE
+// (function-local `var` state is isolated per textual call site in Pine,
+//  so calling this once here gives one independent persistent instance)
+// =====================================================================
+f_structure(srcHigh, srcLow, srcClose, atrValue, L, R, minATRmult, hold) =>
+    var float lastSwingHigh = na
+    var float lastSwingLow  = na
+    var string lastHighType = na
+    var string lastLowType  = na
+    // structClass: raw HH/HL/LH/LL read, can flip freely every bar — informational only,
+    // never gates a signal directly (that was the source of the race described below).
+    var string structClass  = "range"
+    // trendState: the single confirmed source of truth for CHoCH/BOS gating. It only
+    // changes through the confirmation pathway below (immediately when hold<=0, or after
+    // `hold` bars survive when hold>0) — never via a same-bar structural reclassification.
+    var string trendState   = "range"
+    var float pendingLevel  = na
+    var string pendingDir   = na
+    var int pendingBar      = na
+
+    ph = ta.pivothigh(srcHigh, L, R)
+    pl = ta.pivotlow(srcLow, L, R)
+
+    bosUp   = false
+    bosDown = false
+
+    if not na(ph)
+        noiseOkH = na(lastSwingHigh) or math.abs(ph - lastSwingHigh) >= atrValue * minATRmult
+        if noiseOkH
+            if not na(lastSwingHigh)
+                lastHighType := ph > lastSwingHigh ? "HH" : "LH"
+                if trendState == "up" and lastHighType == "HH"
+                    bosUp := true
+            lastSwingHigh := ph
+
+    if not na(pl)
+        noiseOkL = na(lastSwingLow) or math.abs(pl - lastSwingLow) >= atrValue * minATRmult
+        if noiseOkL
+            if not na(lastSwingLow)
+                lastLowType := pl < lastSwingLow ? "LL" : "HL"
+                if trendState == "down" and lastLowType == "LL"
+                    bosDown := true
+            lastSwingLow := pl
+
+    if lastHighType == "HH" and lastLowType == "HL"
+        structClass := "up"
+    else if lastHighType == "LH" and lastLowType == "LL"
+        structClass := "down"
+
+    // Gated on trendState (confirmed), not structClass (raw) — a same-bar reclassification
+    // can no longer bypass hold-bar confirmation the way it previously could.
+    chochUpRaw   = trendState == "down" and not na(lastSwingHigh) and ta.crossover(srcClose, lastSwingHigh)
+    chochDownRaw = trendState == "up"   and not na(lastSwingLow)  and ta.crossunder(srcClose, lastSwingLow)
+
+    chochUp   = false
+    chochDown = false
+
+    if hold <= 0
+        chochUp   := chochUpRaw
+        chochDown := chochDownRaw
+        if chochUp
+            trendState := "up"
+        if chochDown
+            trendState := "down"
+    else
+        // An opposing raw trigger arriving while a pending confirmation is in flight used
+        // to be silently dropped (the na(pendingDir) guard below would just skip it). Price
+        // closing back through the other structural level is itself evidence the pending
+        // call is wrong, so treat it as an implicit failure: cancel the stale pending and
+        // let the same bar arm a fresh pending in the new direction.
+        if chochUpRaw and pendingDir == "down"
+            pendingDir := na
+        if chochDownRaw and pendingDir == "up"
+            pendingDir := na
+
+        if chochUpRaw and na(pendingDir)
+            pendingDir := "up"
+            pendingLevel := lastSwingHigh
+            pendingBar := bar_index
+        if chochDownRaw and na(pendingDir)
+            pendingDir := "down"
+            pendingLevel := lastSwingLow
+            pendingBar := bar_index
+        if not na(pendingDir)
+            barsSince = bar_index - pendingBar
+            failed = pendingDir == "up" ? srcClose < pendingLevel : srcClose > pendingLevel
+            if failed
+                pendingDir := na
+            else if barsSince >= hold
+                chochUp   := pendingDir == "up"
+                chochDown := pendingDir == "down"
+                if chochUp
+                    trendState := "up"
+                if chochDown
+                    trendState := "down"
+                pendingDir := na
+
+    [trendState, chochUp, chochDown, bosUp, bosDown, lastSwingHigh, lastSwingLow]
+
+[structState, chochUp, chochDown, bosUp, bosDown, lastSwingHigh, lastSwingLow] =
+     f_structure(high, low, close, atrVal, pivotLeft, pivotRight, minSwingATRMult, holdBars)
+
+// =====================================================================
+// CANDLESTICK MODULE
+// =====================================================================
+bodyC   = math.abs(close - open)
+rangeC  = high - low
+upWick  = high - math.max(close, open)
+loWick  = math.min(close, open) - low
+
+priorMoveDown = close < close[priorMoveLookback]
+priorMoveUp   = close > close[priorMoveLookback]
+
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and bodyC >= bodyC[1] * engulfMinBodyRatio
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and bodyC >= bodyC[1] * engulfMinBodyRatio
+
+pinBullShape = loWick >= bodyC * pinWickMult and upWick <= bodyC and close > open
+pinBearShape = upWick >= bodyC * pinWickMult and loWick <= bodyC and close < open
+
+hammer     = pinBullShape and priorMoveDown
+hangingMan = pinBearShape and priorMoveUp
+pinBull    = pinBullShape and not hammer
+pinBear    = pinBearShape and not hangingMan
+
+smallBody1 = math.abs(close[1] - open[1]) <= (high[1] - low[1]) * starBodyMaxRatio
+morningStar = close[2] < open[2] and smallBody1 and close > open and close > (open[2] + close[2]) / 2
+eveningStar = close[2] > open[2] and smallBody1 and close < open and close < (open[2] + close[2]) / 2
+
+volSpike = volume >= volSma20 * volSpikeMult
+
+nearLevel(lvl) =>
+    not na(lvl) and math.abs(close - lvl) <= atrVal * levelProxATRmult
+
+candleBullFire = bullEngulf or pinBull or hammer or morningStar
+candleBearFire = bearEngulf or pinBear or hangingMan or eveningStar
+
+candleBullScore = 0.0
+candleBearScore = 0.0
+
+if candleBullFire
+    s = 1.0
+    if hammer or morningStar
+        s += 1.0
+    if nearLevel(lastSwingLow)
+        s += 1.0
+    if volSpike
+        s += 1.0
+    candleBullScore := s
+
+if candleBearFire
+    s2 = 1.0
+    if hangingMan or eveningStar
+        s2 += 1.0
+    if nearLevel(lastSwingHigh)
+        s2 += 1.0
+    if volSpike
+        s2 += 1.0
+    candleBearScore := s2
+
+// Confirmation window: a pattern's score stays "active" for confirmWindowBars bars
+// after it fires, so it can still count toward confluence when the CHoCH bar lands
+// a few bars later (which is the common case — see architecture notes). Purely
+// backward-looking (only reads bar indices/scores already known) — no repaint.
+var float lastCandleBullScore = 0.0
+var int   lastCandleBullBar   = na
+var float lastCandleBearScore = 0.0
+var int   lastCandleBearBar   = na
+
+if candleBullFire
+    lastCandleBullScore := candleBullScore
+    lastCandleBullBar   := bar_index
+if candleBearFire
+    lastCandleBearScore := candleBearScore
+    lastCandleBearBar   := bar_index
+
+candleBullScoreWindowed = not na(lastCandleBullBar) and bar_index - lastCandleBullBar <= confirmWindowBars ? lastCandleBullScore : 0.0
+candleBearScoreWindowed = not na(lastCandleBearBar) and bar_index - lastCandleBearBar <= confirmWindowBars ? lastCandleBearScore : 0.0
+
+// =====================================================================
+// DIVERGENCE MODULE
+// price-pivot-anchored: oscillator value read at the confirmed price pivot bar
+// =====================================================================
+var float lastPLbar = na
+var float lastPLprice = na
+var float lastPLrsi = na
+var float lastPLhist = na
+
+var float lastPHbar = na
+var float lastPHprice = na
+var float lastPHrsi = na
+var float lastPHhist = na
+
+regBullDiv = false
+hidBullDiv = false
+regBearDiv = false
+hidBearDiv = false
+divBullScore = 0.0
+divBearScore = 0.0
+
+plDiv = ta.pivotlow(low, pivotLeft, pivotRight)
+phDiv = ta.pivothigh(high, pivotLeft, pivotRight)
+
+if not na(plDiv)
+    curBar   = bar_index - pivotRight
+    curPrice = plDiv
+    curRsi   = rsiVal[pivotRight]
+    curHist  = histLine[pivotRight]
+    if not na(lastPLprice)
+        gapBars = curBar - lastPLbar
+        priceChgPct = math.abs(curPrice - lastPLprice) / lastPLprice * 100
+        if gapBars >= divMinBars and gapBars <= divMaxBars and priceChgPct >= divMinPriceChgPct
+            rsiAgrees  = curRsi > lastPLrsi
+            histAgrees = curHist > lastPLhist
+            if curPrice < lastPLprice and rsiAgrees
+                regBullDiv := true
+                sc = 1.0
+                if rsiAgrees and histAgrees
+                    sc += 1.0
+                if priceChgPct >= divMinPriceChgPct * 3
+                    sc += 1.0
+                if curRsi < rsiOversoldZone
+                    sc += 1.0
+                if gapBars <= divMinBars * 1.2
+                    sc -= 1.0
+                divBullScore := sc
+            if curPrice > lastPLprice and curRsi < lastPLrsi
+                hidBullDiv := true
+    lastPLbar := curBar
+    lastPLprice := curPrice
+    lastPLrsi := curRsi
+    lastPLhist := curHist
+
+if not na(phDiv)
+    curBarH   = bar_index - pivotRight
+    curPriceH = phDiv
+    curRsiH   = rsiVal[pivotRight]
+    curHistH  = histLine[pivotRight]
+    if not na(lastPHprice)
+        gapBarsH = curBarH - lastPHbar
+        priceChgPctH = math.abs(curPriceH - lastPHprice) / lastPHprice * 100
+        if gapBarsH >= divMinBars and gapBarsH <= divMaxBars and priceChgPctH >= divMinPriceChgPct
+            rsiAgreesH  = curRsiH < lastPHrsi
+            histAgreesH = curHistH < lastPHhist
+            if curPriceH > lastPHprice and rsiAgreesH
+                regBearDiv := true
+                scH = 1.0
+                if rsiAgreesH and histAgreesH
+                    scH += 1.0
+                if priceChgPctH >= divMinPriceChgPct * 3
+                    scH += 1.0
+                if curRsiH > rsiOverboughtZone
+                    scH += 1.0
+                if gapBarsH <= divMinBars * 1.2
+                    scH -= 1.0
+                divBearScore := scH
+            if curPriceH < lastPHprice and curRsiH > lastPHrsi
+                hidBearDiv := true
+    lastPHbar := curBarH
+    lastPHprice := curPriceH
+    lastPHrsi := curRsiH
+    lastPHhist := curHistH
+
+// Same confirmation-window treatment as the candlestick module: a divergence firing
+// on its pivot bar is almost always several bars before the CHoCH bar it should
+// confirm, so hold it "active" for confirmWindowBars bars. Backward-looking only.
+var float lastDivBullScore = 0.0
+var int   lastDivBullBar   = na
+var float lastDivBearScore = 0.0
+var int   lastDivBearBar   = na
+var int   lastHidBullBar   = na
+var int   lastHidBearBar   = na
+
+if regBullDiv
+    lastDivBullScore := divBullScore
+    lastDivBullBar   := bar_index
+if regBearDiv
+    lastDivBearScore := divBearScore
+    lastDivBearBar   := bar_index
+if hidBullDiv
+    lastHidBullBar := bar_index
+if hidBearDiv
+    lastHidBearBar := bar_index
+
+divBullScoreWindowed = not na(lastDivBullBar) and bar_index - lastDivBullBar <= confirmWindowBars ? lastDivBullScore : 0.0
+divBearScoreWindowed = not na(lastDivBearBar) and bar_index - lastDivBearBar <= confirmWindowBars ? lastDivBearScore : 0.0
+hidBullDivWindowed    = not na(lastHidBullBar) and bar_index - lastHidBullBar <= confirmWindowBars
+hidBearDivWindowed    = not na(lastHidBearBar) and bar_index - lastHidBearBar <= confirmWindowBars
+
+// hidden divergence in the opposite direction of a CHoCH argues against the reversal — heuristic penalty
+hiddenConflictUp   = chochUp and hidBearDivWindowed
+hiddenConflictDown = chochDown and hidBullDivWindowed
+
+// =====================================================================
+// HTF CONTEXT (heuristic EMA-slope bias — see limitations)
+// =====================================================================
+
+// Converts a target duration in seconds to a Pine timeframe string. Used to derive
+// HTF #1/#2 as multiples of the chart's OWN timeframe, so "higher timeframe" stays
+// actually higher regardless of whether the chart is opened on 5m, 15m, or 1h — fixed
+// string defaults like "15"/"60" silently stop being "higher" once the chart itself is
+// on 15m or 1h.
+f_secondsToTF(sec) =>
+    mins = int(math.round(sec / 60))
+    string tf = na
+    if mins < 1440
+        tf := str.tostring(math.max(mins, 1))
+    else
+        days = int(math.ceil(mins / 1440.0))
+        tf := str.tostring(days) + "D"
+    tf
+
+chartSec = timeframe.in_seconds()
+htf1Auto = f_secondsToTF(chartSec * htf1Mult)
+htf2Auto = f_secondsToTF(chartSec * htf2Mult)
+
+htf1Resolved = htfAutoScale ? htf1Auto : htf1
+htf2Resolved = htfAutoScale ? htf2Auto : htf2
+
+// Even in manual mode, don't silently treat a same-or-lower timeframe as "higher" —
+// disable that HTF slot's contribution instead of feeding it garbage context.
+htf1Valid = timeframe.in_seconds(htf1Resolved) > chartSec
+htf2Valid = timeframe.in_seconds(htf2Resolved) > chartSec
+
+f_htfBias(tf) =>
+    // EMA must be computed INSIDE the security() expression, on the HTF's own bars.
+    // Computing ta.ema() locally on a request.security-fetched raw `close` series
+    // (a lower-timeframe-repeated staircase of HTF closes) does not reproduce a true
+    // HTF EMA — it distorts the effective smoothing length/alpha. See Pine docs on
+    // "avoid repainting" / recalculating indicators from request.security outputs.
+    ef = request.security(syminfo.tickerid, tf, ta.ema(close, htfEmaFastLen), lookahead=barmerge.lookahead_off)
+    es = request.security(syminfo.tickerid, tf, ta.ema(close, htfEmaSlowLen), lookahead=barmerge.lookahead_off)
+    ef > es ? 1 : ef < es ? -1 : 0
+
+htfBias1 = useHTF and htf1Valid ? f_htfBias(htf1Resolved) : 0
+htfBias2 = useHTF and htf2Valid ? f_htfBias(htf2Resolved) : 0
+htfBiasCombined = htfBias1 + htfBias2  // range -2..2
+
+// =====================================================================
+// SIGNAL SCORING MODULE
+// =====================================================================
+structureScoreUp   = chochUp   ? 2.0 : 0.0
+structureScoreDown = chochDown ? 2.0 : 0.0
+
+htfAlignUp   = htfBiasCombined > 0 ? wHTF : htfBiasCombined < 0 ? -wHTF : 0.0
+htfAlignDown = htfBiasCombined < 0 ? wHTF : htfBiasCombined > 0 ? -wHTF : 0.0
+
+scoreUp   = structureScoreUp   + candleBullScoreWindowed * wCandle + divBullScoreWindowed * wDiverg - (hiddenConflictUp   ? 1.0 : 0.0) + htfAlignUp
+scoreDown = structureScoreDown + candleBearScoreWindowed * wCandle + divBearScoreWindowed * wDiverg - (hiddenConflictDown ? 1.0 : 0.0) + htfAlignDown
+
+htfOkUp   = not requireHTFalign or htfBiasCombined >= 0
+htfOkDown = not requireHTFalign or htfBiasCombined <= 0
+
+signalUp   = chochUp   and scoreUp   >= thresholdUp   and htfOkUp
+signalDown = chochDown and scoreDown >= thresholdDown and htfOkDown
+
+signalCode = signalUp ? 1 : signalDown ? -1 : 0  // for dataset labeling: 1=trend_break_up, -1=trend_break_down, 0=neutral
+
+// =====================================================================
+// STRATEGY EXECUTION
+// Position sizing: qty = (equity * risk%) / stop_distance, so a stopped-out trade
+// loses approximately riskPctPerTrade% of current equity regardless of ATR at entry.
+// Entry price used for the stop/TP levels is approximated from the signal bar's
+// close (fills actually happen at next bar's open, per process_orders_on_close=false
+// above) — a standard, disclosed approximation: actual realized risk can differ
+// slightly from riskPctPerTrade if next-bar open gaps away from this close.
+// =====================================================================
+atrStop = ta.atr(atrStopLen)
+
+longStopDist  = atrStopMult * atrStop
+shortStopDist = atrStopMult * atrStop
+
+longStopPrice  = close - longStopDist
+longTPPrice    = close + longStopDist * rrMultiple
+shortStopPrice = close + shortStopDist
+shortTPPrice   = close - shortStopDist * rrMultiple
+
+riskAmount = strategy.equity * (riskPctPerTrade / 100)
+longQty  = longStopDist  > 0 ? riskAmount / longStopDist  : 0.0
+shortQty = shortStopDist > 0 ? riskAmount / shortStopDist : 0.0
+
+var float activeLongStop  = na
+var float activeLongTP    = na
+var float activeShortStop = na
+var float activeShortTP   = na
+
+// Flat is always a valid entry; flipping out of an opposing position additionally
+// requires flipOnOppositeSignal — otherwise the existing position is left to exit
+// only via its own stop/take-profit bracket.
+canEnterLong  = strategy.position_size == 0 or (flipOnOppositeSignal and strategy.position_size < 0)
+canEnterShort = strategy.position_size == 0 or (flipOnOppositeSignal and strategy.position_size > 0)
+
+if signalUp and allowLong and longQty > 0 and canEnterLong
+    strategy.entry("Long", strategy.long, qty=longQty)
+    activeLongStop := longStopPrice
+    activeLongTP   := longTPPrice
+
+if signalDown and allowShort and shortQty > 0 and canEnterShort
+    strategy.entry("Short", strategy.short, qty=shortQty)
+    activeShortStop := shortStopPrice
+    activeShortTP   := shortTPPrice
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry="Long", stop=activeLongStop, limit=activeLongTP)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry="Short", stop=activeShortStop, limit=activeShortTP)
+
+// =====================================================================
+// PLOTTING / MARKERS
+// =====================================================================
+plotshape(showMarkers and signalUp, title="Trend Break Up", style=shape.labelup, location=location.belowbar,
+     color=color.new(color.green, 0), text="UP", textcolor=color.white, size=size.small)
+plotshape(showMarkers and signalDown, title="Trend Break Down", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.red, 0), text="DOWN", textcolor=color.white, size=size.small)
+
+plotshape(showMarkers and chochUp and not signalUp, title="CHoCH Up (unconfirmed)", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.lime, 60), size=size.tiny)
+plotshape(showMarkers and chochDown and not signalDown, title="CHoCH Down (unconfirmed)", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.orange, 60), size=size.tiny)
+
+plot(showStructure ? lastSwingHigh : na, title="Last Swing High", color=color.new(color.red, 40), style=plot.style_circles)
+plot(showStructure ? lastSwingLow  : na, title="Last Swing Low",  color=color.new(color.green, 40), style=plot.style_circles)
+
+plot(strategy.position_size > 0 ? activeLongStop  : na, title="Active Long Stop",  color=color.new(color.red, 0), style=plot.style_linebr)
+plot(strategy.position_size > 0 ? activeLongTP    : na, title="Active Long TP",    color=color.new(color.lime, 0), style=plot.style_linebr)
+plot(strategy.position_size < 0 ? activeShortStop : na, title="Active Short Stop", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(strategy.position_size < 0 ? activeShortTP   : na, title="Active Short TP",   color=color.new(color.lime, 0), style=plot.style_linebr)
+
+// hidden data-window plots for dataset labeling / NN feature export
+plot(rsiVal, title="RSI (feature)", display=display.data_window)
+plot(histLine, title="MACD Hist (feature)", display=display.data_window)
+plot(candleBullScoreWindowed, title="Candle Bull Score Windowed (feature)", display=display.data_window)
+plot(candleBearScoreWindowed, title="Candle Bear Score Windowed (feature)", display=display.data_window)
+plot(divBullScoreWindowed, title="Divergence Bull Score Windowed (feature)", display=display.data_window)
+plot(divBearScoreWindowed, title="Divergence Bear Score Windowed (feature)", display=display.data_window)
+plot(htfBiasCombined, title="HTF Bias Combined (feature)", display=display.data_window)
+plot(scoreUp, title="Score Up (feature)", display=display.data_window)
+plot(scoreDown, title="Score Down (feature)", display=display.data_window)
+plot(signalCode, title="Signal Code -1/0/1 (label candidate)", display=display.data_window)
+
+// =====================================================================
+// ALERTS
+// (Strategy order-fill alerts are also available natively via TradingView's
+// "Create Alert" dialog with alert() on Order Fills — these alertcondition
+// calls fire on the raw signal instead, useful for eyeballing signal timing.)
+// =====================================================================
+alertcondition(signalUp, title="Trend Break Up", message="{{ticker}} {{interval}}: TREND BREAK UP")
+alertcondition(signalDown, title="Trend Break Down", message="{{ticker}} {{interval}}: TREND BREAK DOWN")
+
+// =====================================================================
+// SCORE / POSITION PANEL
+// =====================================================================
+if showScorePanel and barstate.islast
+    var table t = table.new(position.top_right, 2, 11, border_width=1, bgcolor=color.new(color.black, 70))
+    table.cell(t, 0, 0, "Structure", text_color=color.white)
+    table.cell(t, 1, 0, structState, text_color=color.white)
+    table.cell(t, 0, 1, "Score Up", text_color=color.white)
+    table.cell(t, 1, 1, str.tostring(scoreUp, "#.##"), text_color=color.lime)
+    table.cell(t, 0, 2, "Score Down", text_color=color.white)
+    table.cell(t, 1, 2, str.tostring(scoreDown, "#.##"), text_color=color.red)
+    table.cell(t, 0, 3, "Threshold", text_color=color.white)
+    table.cell(t, 1, 3, str.tostring(thresholdUp, "#.##"), text_color=color.white)
+    table.cell(t, 0, 4, "HTF Bias", text_color=color.white)
+    table.cell(t, 1, 4, str.tostring(htfBiasCombined), text_color=color.white)
+    table.cell(t, 0, 5, "HTF #1 / #2", text_color=color.white)
+    table.cell(t, 1, 5, htf1Resolved + " / " + htf2Resolved, text_color=color.white)
+    table.cell(t, 0, 6, "Mode", text_color=color.white)
+    table.cell(t, 1, 6, modeInput, text_color=color.white)
+    table.cell(t, 0, 7, "Position", text_color=color.white)
+    table.cell(t, 1, 7, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", text_color=color.yellow)
+    table.cell(t, 0, 8, "Position Size", text_color=color.white)
+    table.cell(t, 1, 8, str.tostring(strategy.position_size, "#.####"), text_color=color.white)
+    table.cell(t, 0, 9, "Equity", text_color=color.white)
+    table.cell(t, 1, 9, str.tostring(strategy.equity, "#.##"), text_color=color.white)
+    table.cell(t, 0, 10, "Open P/L", text_color=color.white)
+    table.cell(t, 1, 10, str.tostring(strategy.openprofit, "#.##"), text_color=strategy.openprofit >= 0 ? color.lime : color.red)

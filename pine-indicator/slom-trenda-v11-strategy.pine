@@ -1,0 +1,1591 @@
+//@version=6
+// =============================================================================
+// СЛОМ ТРЕНДА (по методичке) v11 — СТРАТЕГИЯ
+// Тот же сигнальный движок, что и в slom-trenda-v11.pine (индикатор), плюс
+// исполнение: вход по emitLocUp/emitLocDn/emitGlobUp/emitGlobDn (уже
+// дедуплицированные, гейтованные скором сигналы движка), стоп/тейк по той же
+// формуле, что рисует showStopTake в индикаторе (sFar* ± slBufferViz×ATR14,
+// R:R = rrRatioViz), sizing — риск % от equity на сделку.
+// =============================================================================
+strategy("Слом тренда (по методичке) v11 — Strategy", "СЛОМ v11 Strat", overlay = true,
+     initial_capital = 1000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 1, pyramiding = 0, calc_on_every_tick = false, process_orders_on_close = false,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+// initial_capital/commission/slippage — стартовые значения, их можно
+// переопределить во вкладке Strategy Tester → Properties без правки кода.
+// process_orders_on_close=false: заявки исполняются на открытии СЛЕДУЮЩЕГО
+// бара, а не на закрытии бара сигнала — тот же бар не используется одновременно
+// и для генерации, и для заливки сигнала.
+
+// ─────────────────────────────────────────────────────────────────────────────
+G1 = "1. Структура (1H)"
+locLB  = input.int(5,  "Локальный хай/лой: lookback", minval = 2, maxval = 100, group = G1)
+globLB = input.int(20, "Глобальный хай/лой: lookback", minval = 3, maxval = 240, group = G1, tooltip = "Ограничено буфером истории (max_bars_back=500): подтверждение пивота ta.pivothigh/low(globLB, globLB) обращается примерно на 2×lookback баров назад, поэтому потолок ~240, а не 500.")
+
+G0 = "2. Экстремумы"
+showLocExt  = input.bool(true,  "Локальные экстремумы (HH/HL/LH/LL)", group = G0)
+showGlobExt = input.bool(true,  "Глобальные экстремумы", group = G0)
+extText     = input.bool(true,  "Подписи, а не точки", group = G0)
+maxExt      = input.int(80, "Хранить последних экстремумов", minval = 10, maxval = 150, group = G0, tooltip = "Кольцевой буфер: старые метки удаляются явно. Максимум снижен, чтобы сумма всех буферов меток не могла превысить лимит индикатора (500).")
+
+G2 = "3. Закреп"
+refMode = input.string("Тело + подтверждение тенью", "Точка отсчёта пробоя", options = ["Конец тени (строго)", "Тело (мягко, слом внутри зоны)", "Тело + подтверждение тенью"], group = G2)
+useImpulse = input.bool(true, "Импульсный закреп (одна свеча)", group = G2)
+impulseATR = input.float(1.0, "Импульс: тело ≥ × ATR14", minval = 0.3, step = 0.1, group = G2)
+strictMode = input.bool(true, "Полнотелые — строго ПОДРЯД", group = G2)
+holdBars   = input.int(2, "Полнотелых свечей за зоной", minval = 1, maxval = 10, group = G2)
+holdWindow = input.int(8, "Окно закрепа, баров", minval = 2, maxval = 200, group = G2)
+bodyRatio  = input.float(0.5, "Полнотелая свеча: тело ≥ доля диапазона", minval = 0.1, maxval = 1.0, step = 0.05, group = G2)
+requireDir = input.bool(true, "Свечи закрепа — в сторону слома", group = G2)
+
+G5 = "4. EMA и тренд"
+showEMA    = input.bool(true, "EMA 50 / 200", group = G5)
+showTrend  = input.bool(true, "Панель тренда", group = G5)
+showFunnel = input.bool(true, "Счётчики воронки", group = G5)
+
+G3 = "5. Дубли ЛОК/ГЛОБ"
+dupWindow = input.int(10, "Глобальный удаляет метку локального в пределах, баров", minval = 0, maxval = 200, group = G3, tooltip = "Окно, в котором уже нарисованная локальная метка (и её линия/стоп-тейк) снимается задним числом эмитящимся глобальным сломом той же стороны. Алерт, который уже ушёл, отозвать нельзя.")
+
+G4 = "6. Визуализация"
+showLocZones  = input.bool(true, "Зоны локальных сломов", group = G4)
+showGlobZones = input.bool(true, "Зоны глобальных сломов", group = G4)
+keepBroken    = input.bool(true, "Оставлять пробитые зоны", group = G4)
+showBrokenRef = input.bool(true, "Линия пробитого уровня", group = G4)
+maxKeep       = input.int(60, "Хранить последних пробитых зон/линий/меток (отдельно лок. и глоб.)", minval = 5, maxval = 100, group = G4, tooltip = "Буфер делят 3 массива линий и 3 массива меток (плюс maxExt отдельно) — максимум снижен, чтобы сумма не могла превысить лимиты индикатора (500 линий, 500 меток).")
+zoneTransp    = input.int(85, "Прозрачность зон, %", minval = 0, maxval = 100, group = G4)
+showLoc       = input.bool(true, "Метки локальных сломов", group = G4)
+showGlob      = input.bool(true, "Метки глобальных сломов", group = G4)
+showWeak      = input.bool(false, "Показывать слабые сигналы (со скором ниже полного)", group = G4)
+showFailed    = input.bool(false, "Сгоревшие попытки закрепа", group = G4)
+showEarly     = input.bool(false, "Ранний слом — метка на неподтверждённой попытке (не сигнал)", group = G4)
+showVpLines   = input.bool(false, "Показывать POC/Value Area на сломе", group = G4)
+showSweep     = input.bool(true,  "Метка свипа уровня — зоны или активной попытки (видна только если useSweepFilter включён)", group = G4)
+gateSignalsByScore = input.bool(true, "Алерты/стратегия — только полный скор (n/m = 100%, без дублей)", group = G4, tooltip = "ВКЛ (по умолчанию): emit-сигнал (и вход в сделку) отдаётся ТОЛЬКО при полном скоре (full). ВЫКЛ: сигнал засчитывается на любой подтверждённый слом. Эмитящийся глобальный всегда безусловно гасит локальный алерт того же бара. Влияет на реальные входы в сделки — не только на отрисовку.")
+showVwap      = input.bool(false, "VWAP (линия)", group = G4)
+showAvwap     = input.bool(false, "Anchored VWAP (линия)", group = G4)
+showHtfEma    = input.bool(false, "EMA 50/200 старшего TF (линии)", group = G4)
+
+bullCol = input.color(#26a69a, "Bull", inline = "c", group = G4)
+bearCol = input.color(#ef5350, "Bear", inline = "c", group = G4)
+neutCol = color.new(color.gray, 0)
+
+G6 = "7. Доп. фильтры (ложные сломы)"
+useVolFilter = input.bool(false, "Фильтр по объёму", group = G6)
+volLen       = input.int(20, "Объём: период SMA", minval = 2, maxval = 200, group = G6, tooltip = "Ограничено буфером истории (max_bars_back=500): скользящая сумма внутри SMA обращается примерно на length+1 баров назад, потолок 200 держит запас.")
+volMult      = input.float(1.2, "Объём: множитель от SMA", minval = 0.1, step = 0.1, group = G6)
+
+useEmaFilter = input.bool(false, "Слом против EMA — снижает скор", group = G6)
+
+useHtfEmaFilter = input.bool(false, "Слом против EMA старшего TF — снижает скор", group = G6)
+htfTF           = input.timeframe("240", "Старший TF (EMA 50/200), выберите выше текущего графика", group = G6)
+
+useVwapFilter = input.bool(false, "Слом против сессионного VWAP — снижает скор", group = G6)
+
+useAvwapFilter  = input.bool(false, "Слом против Anchored VWAP — снижает скор", group = G6)
+avwapAnchorMode = input.string("Сессия", "Anchored VWAP: точка привязки", options = ["Сессия", "Неделя", "Глобальный экстремум"], group = G6)
+
+useVpFilter = input.bool(false, "Слом должен уходить за Value Area (Volume Profile) — снижает скор", group = G6)
+vpLookback  = input.int(200, "Volume Profile: окно баров", minval = 20, maxval = 500, group = G6)
+vpRows      = input.int(24, "Volume Profile: число уровней", minval = 6, maxval = 50, group = G6)
+vpVaPct     = input.float(70, "Value Area, % объёма", minval = 50, maxval = 95, group = G6)
+
+useOiFilter = input.bool(false, "Слом без роста Open Interest — снижает скор", group = G6)
+oiLookback  = input.int(5, "OI: окно сравнения, баров", minval = 1, maxval = 50, group = G6)
+
+useRetest     = input.bool(false, "Требовать ретест с отбоем перед сигналом", group = G6)
+retestATR     = input.float(0.5, "Ретест: допуск от уровня, × ATR14", minval = 0.1, step = 0.1, group = G6, tooltip = "Насколько близко к сломанному уровню должна вернуться цена, чтобы это считалось ретестом. Большие значения (≈1 ATR и выше) делают фильтр почти сквозным: бар сразу после закрепа попадает в допуск тривиально, и «ретест» вырождается в ожидание одной свечи.")
+retestWindow  = input.int(10, "Ретест: окно ожидания, баров", minval = 2, maxval = 200, group = G6)
+
+useSession = input.bool(false, "Фильтр по сессии — не начинать пробой вне сессии", group = G6)
+sessTime   = input.session("0800-2200", "Разрешённая сессия (UTC)", group = G6)
+
+useSqueezeFilter = input.bool(false, "Фильтр сжатия волатильности — не начинать пробой в сквизе", group = G6)
+atrSmaLen        = input.int(50, "Волатильность: период средней ATR", minval = 5, maxval = 200, group = G6, tooltip = "Ограничено буфером истории (max_bars_back=500): SMA по ATR14 обращается примерно на length+1 баров назад, потолок 200 держит запас.")
+squeezeMult      = input.float(0.7, "Сквиз, если ATR14 < × средней ATR", minval = 0.1, step = 0.05, group = G6)
+
+useSweepFilter = input.bool(false, "Требовать свип уровня (тень + ATR-буфер, закрытие обратно) до закрепа", group = G6)
+sweepATR       = input.float(0.3, "Свип: буфер за экстремумом, × ATR14", minval = 0.0, step = 0.1, group = G6)
+
+G7 = "8. MACD-дивергенция (информационно, на пивотах)"
+useDiv      = input.bool(false, "Показывать MACD-дивергенцию на пивотах", group = G7)
+macdFast    = input.int(12, "MACD: быстрая EMA", minval = 2, group = G7)
+macdSlow    = input.int(26, "MACD: медленная EMA", minval = 3, group = G7)
+macdSig     = input.int(9,  "MACD: сигнальная EMA", minval = 2, group = G7)
+divSource   = input.string("MACD-линия", "Сравнивать по", options = ["MACD-линия", "Гистограмма"], group = G7)
+
+G9 = "9. Стоп/тейк на сломе"
+showStopTake = input.bool(true, "Показывать стоп/тейк на сломе", group = G9)
+rrRatioViz   = input.float(3.0, "R:R", minval = 0.5, step = 0.5, group = G9, tooltip = "Этот же R:R используется и для реального исполнения стратегии в блоке 10 — рисунок и бэктест всегда согласованы.")
+slBufferViz  = input.float(0.3, "Стоп: доп. буфер за зоной, × ATR14", minval = 0, step = 0.1, group = G9)
+
+G10 = "10. Стратегия / риск-менеджмент"
+allowLong  = input.bool(true, "Разрешить Long", group = G10)
+allowShort = input.bool(true, "Разрешить Short", group = G10)
+useLocSignalsTrade  = input.bool(true, "Входить по ЛОК-сигналам", group = G10)
+useGlobSignalsTrade = input.bool(true, "Входить по ГЛОБ-сигналам", group = G10)
+riskPctPerTrade = input.float(10.0, "Риск % от equity на сделку", group = G10, minval = 0.01, maxval = 100,
+     tooltip = "Размер позиции = (equity × риск%) / дистанция до стопа — то есть сделка, добившая до стопа, теряет примерно этот % от ТЕКУЩЕГО (не начального) капитала. 10% на сделку — агрессивный риск: серия из 5-7 стопов подряд ощутимо просаживает депозит. Считается от strategy.equity, поэтому просадка снижает риск в долларах, а прибыль — увеличивает (компаундинг).")
+flipOnOppositeSignal = input.bool(true, "Разворот позиции на противоположном сигнале", group = G10,
+     tooltip = "ВКЛ: подтверждённый сигнал в обратную сторону закрывает текущую позицию и сразу открывает новую. ВЫКЛ: текущая позиция выходит только по своему стопу/тейку, новая открывается лишь при отсутствии позиции.")
+
+strictRef  = refMode == "Конец тени (строго)"
+needWickOK = refMode == "Тело + подтверждение тенью"
+
+// БАГФИКС: в тултипе сигнала считается интервал «бар пробоя → бар сигнала».
+// Без ретеста бар сигнала = бар закрепа, а с ретестом в этот же интервал
+// попадает ещё и окно ожидания отбоя — текст не должен выдавать одно за другое
+sigBarsTxt = useRetest ? "\nБаров от пробоя до сигнала (вкл. ожидание ретеста): " : "\nБаров от пробоя до закрепа: "
+
+// ─────────────────────────────────────────────────────────────────────────────
+emaFast  = ta.ema(close, 50)
+emaSlow  = ta.ema(close, 200)
+emaTrend = emaFast > emaSlow and close > emaFast ? 1 : emaFast < emaSlow and close < emaFast ? -1 : 0
+emaDataOK = not na(emaFast) and not na(emaSlow)
+
+[htfEmaFast, htfEmaSlow, htfClose] = request.security(syminfo.tickerid, htfTF, [ta.ema(close, 50)[1], ta.ema(close, 200)[1], close[1]], barmerge.gaps_off, barmerge.lookahead_off)
+htfTrend   = htfEmaFast > htfEmaSlow and htfClose > htfEmaFast ? 1 : htfEmaFast < htfEmaSlow and htfClose < htfEmaFast ? -1 : 0
+htfDataOK  = not na(htfEmaFast) and not na(htfEmaSlow) and not na(htfClose)
+
+vwapVal = ta.vwap
+vwapDataOK = not na(vwapVal)
+
+oiClose  = request.security(syminfo.tickerid + "_OI", timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol = true)
+oiDataOK = not na(oiClose) and not na(oiClose[oiLookback])
+oiRising = oiDataOK and oiClose > oiClose[oiLookback]
+
+plot(showEMA ? emaFast : na, "EMA 50",  color = color.new(#ffb74d, 0))
+plot(showEMA ? emaSlow : na, "EMA 200", color = color.new(#7e57c2, 0), linewidth = 2)
+
+macdFastMA = ta.ema(close, macdFast)
+macdSlowMA = ta.ema(close, macdSlow)
+macdLine   = macdFastMA - macdSlowMA
+macdSignal = ta.ema(macdLine, macdSig)
+macdHist   = macdLine - macdSignal
+divVal     = divSource == "Гистограмма" ? macdHist : macdLine
+
+atr14 = ta.atr(14)
+
+phLoc  = ta.pivothigh(high, locLB,  locLB)
+plLoc  = ta.pivotlow(low,   locLB,  locLB)
+phGlob = ta.pivothigh(high, globLB, globLB)
+plGlob = ta.pivotlow(low,   globLB, globLB)
+
+bodySz   = math.abs(close - open)
+rng      = high - low
+fullBody = rng > 0 and bodySz / rng >= bodyRatio
+impBody  = bodySz >= impulseATR * atr14
+
+volSmaVal = ta.sma(volume, volLen)
+volDataOK = not na(volume) and not na(volSmaVal)
+volOK    = not useVolFilter or not volDataOK or volume >= volSmaVal * volMult
+
+holdUpC  = fullBody and (not requireDir or close > open) and volOK
+holdDnC  = fullBody and (not requireDir or close < open) and volOK
+impUpC   = useImpulse and impBody and close > open and volOK
+impDnC   = useImpulse and impBody and close < open and volOK
+
+sessOK = not useSession or not timeframe.isintraday or not na(time(timeframe.period, sessTime, "UTC"))
+
+atrSMA    = ta.sma(atr14, atrSmaLen)
+squeezeDataOK = not na(atr14) and not na(atrSMA)
+squeezeOK = not useSqueezeFilter or not squeezeDataOK or atr14 >= atrSMA * squeezeMult
+
+startOK = sessOK and squeezeOK
+
+// БУФЕРЫ РИСОВАНИЯ -------------------------------------------------------------
+var array<box>   keptLocBoxes  = array.new<box>()
+var array<box>   keptGlobBoxes = array.new<box>()
+var array<line>  keptLocLines  = array.new<line>()
+var array<line>  keptGlobLines = array.new<line>()
+var array<label> keptExt       = array.new<label>()
+var array<label> keptSig       = array.new<label>()
+var array<label> keptSweep     = array.new<label>()
+var array<line>  keptStopTake    = array.new<line>()
+var array<label> keptStopTakeLbl = array.new<label>()
+
+pushLocBox(box b) =>
+    array.push(keptLocBoxes, b)
+    while array.size(keptLocBoxes) > maxKeep
+        box.delete(array.shift(keptLocBoxes))
+
+pushGlobBox(box b) =>
+    array.push(keptGlobBoxes, b)
+    while array.size(keptGlobBoxes) > maxKeep
+        box.delete(array.shift(keptGlobBoxes))
+
+pushLocLine(line l) =>
+    array.push(keptLocLines, l)
+    while array.size(keptLocLines) > maxKeep
+        line.delete(array.shift(keptLocLines))
+
+pushGlobLine(line l) =>
+    array.push(keptGlobLines, l)
+    while array.size(keptGlobLines) > maxKeep
+        line.delete(array.shift(keptGlobLines))
+
+pushExt(label lb) =>
+    array.push(keptExt, lb)
+    while array.size(keptExt) > maxExt
+        label.delete(array.shift(keptExt))
+
+pushSig(label lb) =>
+    array.push(keptSig, lb)
+    while array.size(keptSig) > maxKeep
+        label.delete(array.shift(keptSig))
+
+removeSig(label lb) =>
+    idx = array.indexof(keptSig, lb)
+    if idx >= 0
+        array.remove(keptSig, idx)
+
+removeLocLine(line l) =>
+    idx = array.indexof(keptLocLines, l)
+    if idx >= 0
+        array.remove(keptLocLines, idx)
+
+removeLocBox(box b) =>
+    idx = array.indexof(keptLocBoxes, b)
+    if idx >= 0
+        array.remove(keptLocBoxes, idx)
+
+removeGlobBox(box b) =>
+    idx = array.indexof(keptGlobBoxes, b)
+    if idx >= 0
+        array.remove(keptGlobBoxes, idx)
+
+removeStopTake(line l) =>
+    idx = array.indexof(keptStopTake, l)
+    if idx >= 0
+        array.remove(keptStopTake, idx)
+
+removeStopTakeLbl(label lb) =>
+    idx = array.indexof(keptStopTakeLbl, lb)
+    if idx >= 0
+        array.remove(keptStopTakeLbl, idx)
+
+pushSweep(label lb) =>
+    array.push(keptSweep, lb)
+    while array.size(keptSweep) > maxKeep
+        label.delete(array.shift(keptSweep))
+
+pushStopTake(line l) =>
+    array.push(keptStopTake, l)
+    while array.size(keptStopTake) > maxKeep
+        line.delete(array.shift(keptStopTake))
+
+pushStopTakeLbl(label lb) =>
+    array.push(keptStopTakeLbl, lb)
+    while array.size(keptStopTakeLbl) > maxKeep
+        label.delete(array.shift(keptStopTakeLbl))
+
+syncEarly(active, cnt, target, lbl, px, isUp, col) =>
+    label.delete(lbl)
+    label result = na
+    if active
+        txt = "Слом? " + str.tostring(cnt) + "/" + str.tostring(target)
+        st = isUp ? label.style_label_up : label.style_label_down
+        result := label.new(bar_index, px, txt, style = st, color = color.new(col, 80), textcolor = color.new(col, 0), size = size.tiny)
+    result
+
+computeVA(lookback, rows, vaPct) =>
+    hi = high[1]
+    lo = low[1]
+    for i = 2 to lookback - 1
+        hi := math.max(hi, high[i])
+        lo := math.min(lo, low[i])
+    step = (hi - lo) / rows
+    vol = array.new_float(rows, 0.0)
+    if step > 0
+        for i = 1 to lookback - 1
+            binIdx = int(math.min(rows - 1, math.floor((hlc3[i] - lo) / step)))
+            array.set(vol, binIdx, array.get(vol, binIdx) + volume[i])
+    pocIdx = 0
+    maxV = 0.0
+    for i = 0 to rows - 1
+        v = array.get(vol, i)
+        if v > maxV
+            maxV := v
+            pocIdx := i
+    totalVol = array.sum(vol)
+    targetVol = totalVol * vaPct / 100.0
+    vaLo = pocIdx
+    vaHi = pocIdx
+    vaVol = array.get(vol, pocIdx)
+    while vaVol < targetVol and (vaLo > 0 or vaHi < rows - 1)
+        volBelow = vaLo > 0 ? array.get(vol, vaLo - 1) : -1.0
+        volAbove = vaHi < rows - 1 ? array.get(vol, vaHi + 1) : -1.0
+        if volAbove >= volBelow
+            vaHi += 1
+            vaVol += volAbove
+        else
+            vaLo -= 1
+            vaVol += volBelow
+    pocPrice    = step > 0 ? lo + (pocIdx + 0.5) * step : na
+    vaHighPrice = step > 0 ? lo + (vaHi + 1) * step : na
+    vaLowPrice  = step > 0 ? lo + vaLo * step : na
+    [pocPrice, vaLowPrice, vaHighPrice]
+
+// ЭКСТРЕМУМЫ: предыдущие значения для классификации ----------------------------
+var float prevLocPH = na
+var float prevLocPL = na
+var float prevGlobPH = na
+var float prevGlobPL = na
+
+var float prevLocPH_div = na
+var float prevLocPL_div = na
+var float prevGlobPH_div = na
+var float prevGlobPL_div = na
+
+// ЗОНЫ ------------------------------------------------------------------------
+var float lhTop = na
+var float lhBot = na
+var box   lhBox = na
+var float ghTop = na
+var float ghBot = na
+var box   ghBox = na
+var float llBot = na
+var float llTop = na
+var box   llBox = na
+var float glBot = na
+var float glTop = na
+var box   glBox = na
+var int   ghBar = na
+var int   glBar = na
+var int   lhZoneBar = na
+var int   llZoneBar = na
+
+var bool  lhSwept = false
+var bool  ghSwept = false
+var bool  llSwept = false
+var bool  glSwept = false
+
+var float avwapPV = 0.0
+var float avwapV  = 0.0
+
+// ПОПЫТКИ ---------------------------------------------------------------------
+var bool  aLHon = false
+var float aLHref = na
+var float aLHfar = na
+var float aLHwick = na
+var bool  aLHwickOK = false
+var int   aLHbar = na
+var int   aLHcnt = 0
+var box   aLHbox = na
+var int   aLHzbar = na
+var bool  aLHarch = false
+
+var bool  aGHon = false
+var float aGHref = na
+var float aGHfar = na
+var float aGHwick = na
+var bool  aGHwickOK = false
+var int   aGHbar = na
+var int   aGHcnt = 0
+var box   aGHbox = na
+var int   aGHzbar = na
+var bool  aGHarch = false
+
+var bool  aLLon = false
+var float aLLref = na
+var float aLLfar = na
+var float aLLwick = na
+var bool  aLLwickOK = false
+var int   aLLbar = na
+var int   aLLcnt = 0
+var box   aLLbox = na
+var int   aLLzbar = na
+var bool  aLLarch = false
+
+var bool  aGLon = false
+var float aGLref = na
+var float aGLfar = na
+var float aGLwick = na
+var bool  aGLwickOK = false
+var int   aGLbar = na
+var int   aGLcnt = 0
+var box   aGLbox = na
+var int   aGLzbar = na
+var bool  aGLarch = false
+
+var bool  aLHswept = false
+var bool  aLLswept = false
+var bool  aGHswept = false
+var bool  aGLswept = false
+
+var label eLHlbl = na
+var label eGHlbl = na
+var label eLLlbl = na
+var label eGLlbl = na
+
+var float lhBroken = na
+var float lhBrokenFar = na
+var float ghBroken = na
+var float ghBrokenFar = na
+var float llBroken = na
+var float llBrokenFar = na
+var float glBroken = na
+var float glBrokenFar = na
+
+var int   locLastDir = 0
+var float locLastLvl = na
+var int   globLastDir = 0
+var float globLastLvl = na
+
+var label locLblUp = na
+var int   locLblUpBar = na
+var label locLblDn = na
+var int   locLblDnBar = na
+var line  locLineUp = na
+var line  locLineDn = na
+var line  locVpPocUp   = na
+var line  locVpVaHiUp  = na
+var line  locVpVaLoUp  = na
+var line  locStopUp    = na
+var line  locTakeUp    = na
+var label locTakeLblUp = na
+var line  locVpPocDn   = na
+var line  locVpVaHiDn  = na
+var line  locVpVaLoDn  = na
+var line  locStopDn    = na
+var line  locTakeDn    = na
+var label locTakeLblDn = na
+
+var int nStarted    = 0
+var int nFailBack   = 0
+var int nFailWindow = 0
+var int nRebind     = 0
+var int nReborn     = 0
+var int nLocSlom    = 0
+var int nGlobSlom   = 0
+var int nRetestFail = 0
+
+var bool  rtLHon = false
+var float rtLHlvl = na
+var int   rtLHbar = na
+var int   rtLHstb = na
+var bool  rtLHtouched = false
+var float rtLHfar = na
+
+var bool  rtLLon = false
+var float rtLLlvl = na
+var int   rtLLbar = na
+var int   rtLLstb = na
+var bool  rtLLtouched = false
+var float rtLLfar = na
+
+var bool  rtGHon = false
+var float rtGHlvl = na
+var int   rtGHbar = na
+var int   rtGHstb = na
+var bool  rtGHtouched = false
+var float rtGHfar = na
+
+var bool  rtGLon = false
+var float rtGLlvl = na
+var int   rtGLbar = na
+var int   rtGLstb = na
+var bool  rtGLtouched = false
+var float rtGLfar = na
+
+bool sigLocUp  = false
+bool sigLocDn  = false
+bool sigGlobUp = false
+bool sigGlobDn = false
+bool failedTry = false
+
+bool emitLocUp  = false
+bool emitLocDn  = false
+bool emitGlobUp = false
+bool emitGlobDn = false
+
+float sLvlLocUp = na
+float sLvlLocDn = na
+float sLvlGlobUp = na
+float sLvlGlobDn = na
+int   sBarLocUp = na
+int   sBarLocDn = na
+int   sBarGlobUp = na
+int   sBarGlobDn = na
+float sFarLocUp = na
+float sFarLocDn = na
+float sFarGlobUp = na
+float sFarGlobDn = na
+
+anchorSession = ta.change(time("D")) != 0
+anchorWeek    = ta.change(time("W")) != 0
+anchorSwing   = not na(phGlob) or not na(plGlob)
+anchorNow = avwapAnchorMode == "Сессия" ? anchorSession : avwapAnchorMode == "Неделя" ? anchorWeek : anchorSwing
+if anchorNow
+    avwapPV := 0.0
+    avwapV  := 0.0
+    if avwapAnchorMode == "Глобальный экстремум"
+        for k = globLB to 1
+            avwapPV += hlc3[k] * volume[k]
+            avwapV  += volume[k]
+avwapPV += hlc3 * volume
+avwapV  += volume
+avwapVal = avwapV > 0 ? avwapPV / avwapV : na
+avwapDataOK = not na(avwapVal)
+
+plot(showVwap ? vwapVal : na, "VWAP", color = color.new(color.yellow, 0))
+plot(showAvwap ? avwapVal : na, "Anchored VWAP", color = color.new(color.orange, 0))
+plot(showHtfEma ? htfEmaFast : na, "HTF EMA 50", color = color.new(#ffb74d, 50))
+plot(showHtfEma ? htfEmaSlow : na, "HTF EMA 200", color = color.new(#7e57c2, 50))
+
+if barstate.isconfirmed
+
+    // ===== ЗОНЫ + РАЗМЕТКА ЭКСТРЕМУМОВ ======================================
+    if not na(phLoc)
+        pb = bar_index - locLB
+        cls = na(prevLocPH) ? "H" : (phLoc > prevLocPH ? "HH" : "LH")
+        divNow = divVal[locLB]
+        divBear = useDiv and cls == "HH" and not na(prevLocPH_div) and divNow <= prevLocPH_div
+        if showLocExt
+            c = cls == "HH" ? bullCol : cls == "LH" ? bearCol : neutCol
+            lblTxt = extText ? cls + (divBear ? "÷" : "") : ""
+            tt = cls + (divBear ? " + MACD-дивергенция" : "") + " · " + str.tostring(phLoc, format.mintick)
+            pushExt(label.new(pb, phLoc, lblTxt, style = label.style_label_down, color = extText ? color.new(c, 70) : color.new(c, 30), textcolor = color.new(c, 0), size = size.tiny, tooltip = tt))
+        prevLocPH := phLoc
+        prevLocPH_div := divNow
+
+        if not na(lhBox)
+            if aLHon and aLHzbar == lhZoneBar
+                pushLocBox(lhBox)
+                aLHarch := true
+            else
+                box.delete(lhBox)
+        lhTop := high[locLB]
+        lhBot := math.max(open[locLB], close[locLB])
+        lhBox := showLocZones ? box.new(pb, lhTop, bar_index, lhBot, border_color = color.new(bearCol, 45), bgcolor = color.new(bearCol, zoneTransp), border_width = 1) : na
+        lhZoneBar := bar_index
+        lhSwept := false
+
+    if not na(plLoc)
+        pb = bar_index - locLB
+        cls = na(prevLocPL) ? "L" : (plLoc > prevLocPL ? "HL" : "LL")
+        divNow = divVal[locLB]
+        divBull = useDiv and cls == "LL" and not na(prevLocPL_div) and divNow >= prevLocPL_div
+        if showLocExt
+            c = cls == "HL" ? bullCol : cls == "LL" ? bearCol : neutCol
+            lblTxt = extText ? cls + (divBull ? "÷" : "") : ""
+            tt = cls + (divBull ? " + MACD-дивергенция" : "") + " · " + str.tostring(plLoc, format.mintick)
+            pushExt(label.new(pb, plLoc, lblTxt, style = label.style_label_up, color = extText ? color.new(c, 70) : color.new(c, 30), textcolor = color.new(c, 0), size = size.tiny, tooltip = tt))
+        prevLocPL := plLoc
+        prevLocPL_div := divNow
+
+        if not na(llBox)
+            if aLLon and aLLzbar == llZoneBar
+                pushLocBox(llBox)
+                aLLarch := true
+            else
+                box.delete(llBox)
+        llBot := low[locLB]
+        llTop := math.min(open[locLB], close[locLB])
+        llBox := showLocZones ? box.new(pb, llTop, bar_index, llBot, border_color = color.new(bullCol, 45), bgcolor = color.new(bullCol, zoneTransp), border_width = 1) : na
+        llZoneBar := bar_index
+        llSwept := false
+
+    if not na(phGlob)
+        pb = bar_index - globLB
+        cls = na(prevGlobPH) ? "H" : (phGlob > prevGlobPH ? "HH" : "LH")
+        divNow = divVal[globLB]
+        divBear = useDiv and cls == "HH" and not na(prevGlobPH_div) and divNow <= prevGlobPH_div
+        if showGlobExt
+            c = cls == "HH" ? bullCol : cls == "LH" ? bearCol : neutCol
+            lblTxt = extText ? cls + (divBear ? "÷" : "") : ""
+            tt = "ГЛОБАЛЬНЫЙ " + cls + (divBear ? " + MACD-дивергенция" : "") + " · " + str.tostring(phGlob, format.mintick)
+            pushExt(label.new(pb, phGlob, lblTxt, style = label.style_label_down, color = color.new(c, 20), textcolor = color.white, size = size.small, tooltip = tt))
+        prevGlobPH := phGlob
+        prevGlobPH_div := divNow
+
+        if not na(ghBox)
+            if aGHon and aGHzbar == ghBar
+                pushGlobBox(ghBox)
+                aGHarch := true
+            else
+                box.delete(ghBox)
+        ghTop := high[globLB]
+        ghBot := math.max(open[globLB], close[globLB])
+        ghBox := showGlobZones ? box.new(pb, ghTop, bar_index, ghBot, border_color = color.new(bearCol, 10), bgcolor = color.new(bearCol, zoneTransp), border_width = 2) : na
+        ghBar := bar_index
+        ghSwept := false
+
+    if not na(plGlob)
+        pb = bar_index - globLB
+        cls = na(prevGlobPL) ? "L" : (plGlob > prevGlobPL ? "HL" : "LL")
+        divNow = divVal[globLB]
+        divBull = useDiv and cls == "LL" and not na(prevGlobPL_div) and divNow >= prevGlobPL_div
+        if showGlobExt
+            c = cls == "HL" ? bullCol : cls == "LL" ? bearCol : neutCol
+            lblTxt = extText ? cls + (divBull ? "÷" : "") : ""
+            tt = "ГЛОБАЛЬНЫЙ " + cls + (divBull ? " + MACD-дивергенция" : "") + " · " + str.tostring(plGlob, format.mintick)
+            pushExt(label.new(pb, plGlob, lblTxt, style = label.style_label_up, color = color.new(c, 20), textcolor = color.white, size = size.small, tooltip = tt))
+        prevGlobPL := plGlob
+        prevGlobPL_div := divNow
+
+        if not na(glBox)
+            if aGLon and aGLzbar == glBar
+                pushGlobBox(glBox)
+                aGLarch := true
+            else
+                box.delete(glBox)
+        glBot := low[globLB]
+        glTop := math.min(open[globLB], close[globLB])
+        glBox := showGlobZones ? box.new(pb, glTop, bar_index, glBot, border_color = color.new(bullCol, 10), bgcolor = color.new(bullCol, zoneTransp), border_width = 2) : na
+        glBar := bar_index
+        glSwept := false
+
+    if not na(lhBox)
+        box.set_right(lhBox, bar_index)
+    if not na(llBox)
+        box.set_right(llBox, bar_index)
+    if not na(ghBox)
+        box.set_right(ghBox, bar_index)
+    if not na(glBox)
+        box.set_right(glBox, bar_index)
+
+    if aLHarch and not na(aLHbox)
+        box.set_right(aLHbox, bar_index)
+    if aLLarch and not na(aLLbox)
+        box.set_right(aLLbox, bar_index)
+    if aGHarch and not na(aGHbox)
+        box.set_right(aGHbox, bar_index)
+    if aGLarch and not na(aGLbox)
+        box.set_right(aGLbox, bar_index)
+
+    // ===== СВИП ЛИКВИДНОСТИ (фильтр D) ======================================
+    if useSweepFilter
+        if not lhSwept and not na(lhTop) and high >= lhTop + sweepATR * atr14 and close < lhTop
+            lhSwept := true
+            if showSweep
+                pushSweep(label.new(bar_index, high, "свип", style = label.style_label_down, color = color.new(neutCol, 40), textcolor = color.white, size = size.tiny, tooltip = "Свип ЛОК-хая: тень выше " + str.tostring(lhTop, format.mintick) + ", закрытие обратно"))
+        if aLHon and not aLHswept and not na(aLHwick) and high >= aLHwick + sweepATR * atr14 and close < aLHwick
+            aLHswept := true
+            if showSweep and aLHwick != lhTop
+                pushSweep(label.new(bar_index, high, "свип", style = label.style_label_down, color = color.new(neutCol, 40), textcolor = color.white, size = size.tiny, tooltip = "Свип уровня активной попытки (ЛОК-хай " + str.tostring(aLHwick, format.mintick) + "): тень выше, закрытие обратно"))
+        if not llSwept and not na(llBot) and low <= llBot - sweepATR * atr14 and close > llBot
+            llSwept := true
+            if showSweep
+                pushSweep(label.new(bar_index, low, "свип", style = label.style_label_up, color = color.new(neutCol, 40), textcolor = color.white, size = size.tiny, tooltip = "Свип ЛОК-лоя: тень ниже " + str.tostring(llBot, format.mintick) + ", закрытие обратно"))
+        if aLLon and not aLLswept and not na(aLLwick) and low <= aLLwick - sweepATR * atr14 and close > aLLwick
+            aLLswept := true
+            if showSweep and aLLwick != llBot
+                pushSweep(label.new(bar_index, low, "свип", style = label.style_label_up, color = color.new(neutCol, 40), textcolor = color.white, size = size.tiny, tooltip = "Свип уровня активной попытки (ЛОК-лой " + str.tostring(aLLwick, format.mintick) + "): тень ниже, закрытие обратно"))
+        if not ghSwept and not na(ghTop) and high >= ghTop + sweepATR * atr14 and close < ghTop
+            ghSwept := true
+            if showSweep
+                pushSweep(label.new(bar_index, high, "свип", style = label.style_label_down, color = color.new(neutCol, 20), textcolor = color.white, size = size.small, tooltip = "Свип ГЛОБ-хая: тень выше " + str.tostring(ghTop, format.mintick) + ", закрытие обратно"))
+        if aGHon and not aGHswept and not na(aGHwick) and high >= aGHwick + sweepATR * atr14 and close < aGHwick
+            aGHswept := true
+            if showSweep and aGHwick != ghTop
+                pushSweep(label.new(bar_index, high, "свип", style = label.style_label_down, color = color.new(neutCol, 20), textcolor = color.white, size = size.small, tooltip = "Свип уровня активной попытки (ГЛОБ-хай " + str.tostring(aGHwick, format.mintick) + "): тень выше, закрытие обратно"))
+        if not glSwept and not na(glBot) and low <= glBot - sweepATR * atr14 and close > glBot
+            glSwept := true
+            if showSweep
+                pushSweep(label.new(bar_index, low, "свип", style = label.style_label_up, color = color.new(neutCol, 20), textcolor = color.white, size = size.small, tooltip = "Свип ГЛОБ-лоя: тень ниже " + str.tostring(glBot, format.mintick) + ", закрытие обратно"))
+        if aGLon and not aGLswept and not na(aGLwick) and low <= aGLwick - sweepATR * atr14 and close > aGLwick
+            aGLswept := true
+            if showSweep and aGLwick != glBot
+                pushSweep(label.new(bar_index, low, "свип", style = label.style_label_up, color = color.new(neutCol, 20), textcolor = color.white, size = size.small, tooltip = "Свип уровня активной попытки (ГЛОБ-лой " + str.tostring(aGLwick, format.mintick) + "): тень ниже, закрытие обратно"))
+
+    // ===== СБРОС «УЖЕ СЛОМАН» ===============================================
+    if not na(lhBroken) and close < lhBrokenFar
+        lhBroken := na
+        lhBrokenFar := na
+        nReborn += 1
+        if rtLHon
+            rtLHon := false
+            nRetestFail += 1
+    if not na(ghBroken) and close < ghBrokenFar
+        ghBroken := na
+        ghBrokenFar := na
+        nReborn += 1
+        if rtGHon
+            rtGHon := false
+            nRetestFail += 1
+    if not na(llBroken) and close > llBrokenFar
+        llBroken := na
+        llBrokenFar := na
+        nReborn += 1
+        if rtLLon
+            rtLLon := false
+            nRetestFail += 1
+    if not na(glBroken) and close > glBrokenFar
+        glBroken := na
+        glBrokenFar := na
+        nReborn += 1
+        if rtGLon
+            rtGLon := false
+            nRetestFail += 1
+
+    zLH = strictRef ? lhTop : lhBot
+    zGH = strictRef ? ghTop : ghBot
+    zLL = strictRef ? llBot : llTop
+    zGL = strictRef ? glBot : glTop
+
+    // ===== ПЕРЕПРИВЯЗКА ======================================================
+    if aLHon and not na(zLH) and zLH > aLHref
+        aLHon := false
+        aLHcnt := 0
+        if aLHarch and not na(aLHbox)
+            removeLocBox(aLHbox)
+            box.delete(aLHbox)
+        aLHbox := na
+        aLHarch := false
+        nRebind += 1
+    if aGHon and not na(zGH) and zGH > aGHref
+        aGHon := false
+        aGHcnt := 0
+        if aGHarch and not na(aGHbox)
+            removeGlobBox(aGHbox)
+            box.delete(aGHbox)
+        aGHbox := na
+        aGHarch := false
+        nRebind += 1
+    if aLLon and not na(zLL) and zLL < aLLref
+        aLLon := false
+        aLLcnt := 0
+        if aLLarch and not na(aLLbox)
+            removeLocBox(aLLbox)
+            box.delete(aLLbox)
+        aLLbox := na
+        aLLarch := false
+        nRebind += 1
+    if aGLon and not na(zGL) and zGL < aGLref
+        aGLon := false
+        aGLcnt := 0
+        if aGLarch and not na(aGLbox)
+            removeGlobBox(aGLbox)
+            box.delete(aGLbox)
+        aGLbox := na
+        aGLarch := false
+        nRebind += 1
+
+    // ===== РЕТЕСТ (фильтр C, только если useRetest) =========================
+    if rtLHon
+        if bar_index > rtLHbar and not rtLHtouched and low <= rtLHlvl + retestATR * atr14
+            rtLHtouched := true
+        if rtLHtouched and close > rtLHlvl
+            sigLocUp := true
+            sLvlLocUp := rtLHlvl
+            sBarLocUp := rtLHstb
+            sFarLocUp := rtLHfar
+            rtLHon := false
+        else if bar_index - rtLHbar >= retestWindow
+            rtLHon := false
+            nRetestFail += 1
+
+    if rtLLon
+        if bar_index > rtLLbar and not rtLLtouched and high >= rtLLlvl - retestATR * atr14
+            rtLLtouched := true
+        if rtLLtouched and close < rtLLlvl
+            sigLocDn := true
+            sLvlLocDn := rtLLlvl
+            sBarLocDn := rtLLstb
+            sFarLocDn := rtLLfar
+            rtLLon := false
+        else if bar_index - rtLLbar >= retestWindow
+            rtLLon := false
+            nRetestFail += 1
+
+    if rtGHon
+        if bar_index > rtGHbar and not rtGHtouched and low <= rtGHlvl + retestATR * atr14
+            rtGHtouched := true
+        if rtGHtouched and close > rtGHlvl
+            sigGlobUp := true
+            sLvlGlobUp := rtGHlvl
+            sBarGlobUp := rtGHstb
+            sFarGlobUp := rtGHfar
+            rtGHon := false
+        else if bar_index - rtGHbar >= retestWindow
+            rtGHon := false
+            nRetestFail += 1
+
+    if rtGLon
+        if bar_index > rtGLbar and not rtGLtouched and high >= rtGLlvl - retestATR * atr14
+            rtGLtouched := true
+        if rtGLtouched and close < rtGLlvl
+            sigGlobDn := true
+            sLvlGlobDn := rtGLlvl
+            sBarGlobDn := rtGLstb
+            sFarGlobDn := rtGLfar
+            rtGLon := false
+        else if bar_index - rtGLbar >= retestWindow
+            rtGLon := false
+            nRetestFail += 1
+
+    // ===== ЗАКРЕП ===========================================================
+    refLH = aLHon ? aLHref : zLH
+    if not na(refLH) and (na(lhBroken) or refLH != lhBroken)
+        if close > refLH and (aLHon or startOK)
+            if not aLHon
+                aLHon := true
+                aLHref := refLH
+                aLHfar := lhBot
+                aLHwick := lhTop
+                aLHwickOK := false
+                aLHbar := bar_index
+                aLHcnt := 0
+                aLHswept := lhSwept
+                aLHbox := lhBox
+                aLHzbar := lhZoneBar
+                aLHarch := false
+                nStarted += 1
+            if close > aLHwick
+                aLHwickOK := true
+            if impUpC
+                aLHcnt := holdBars
+            else if holdUpC
+                aLHcnt += 1
+            else if strictMode
+                aLHcnt := 0
+            if aLHcnt >= holdBars and (not needWickOK or aLHwickOK) and (not useSweepFilter or aLHswept)
+                lhBroken := aLHref
+                lhBrokenFar := aLHfar
+                if keepBroken and not na(aLHbox)
+                    box.set_bgcolor(aLHbox, color.new(bearCol, math.max(zoneTransp - 15, 0)))
+                    if not aLHarch
+                        pushLocBox(aLHbox)
+                else if not keepBroken and not na(aLHbox)
+                    if aLHarch
+                        removeLocBox(aLHbox)
+                    box.delete(aLHbox)
+                if aLHzbar == lhZoneBar
+                    lhBox := na
+                    lhSwept := false
+                aLHbox := na
+                aLHarch := false
+                if useRetest
+                    if rtLHon
+                        nRetestFail += 1
+                    rtLHon := true
+                    rtLHlvl := aLHref
+                    rtLHbar := bar_index
+                    rtLHstb := aLHbar
+                    rtLHtouched := false
+                    rtLHfar := aLHfar
+                else
+                    sigLocUp := true
+                    sLvlLocUp := aLHref
+                    sBarLocUp := aLHbar
+                    sFarLocUp := aLHfar
+                aLHon := false
+                aLHcnt := 0
+            else if bar_index - aLHbar >= holdWindow
+                failedTry := true
+                nFailWindow += 1
+                aLHon := false
+                aLHcnt := 0
+                if aLHarch and not na(aLHbox)
+                    removeLocBox(aLHbox)
+                    box.delete(aLHbox)
+                aLHbox := na
+                aLHarch := false
+        else
+            if aLHon
+                failedTry := true
+                nFailBack += 1
+            aLHon := false
+            aLHcnt := 0
+            if aLHarch and not na(aLHbox)
+                removeLocBox(aLHbox)
+                box.delete(aLHbox)
+            aLHbox := na
+            aLHarch := false
+    if showEarly
+        eLHlbl := syncEarly(aLHon, aLHcnt, holdBars, eLHlbl, low, true, bullCol)
+
+    refLL = aLLon ? aLLref : zLL
+    if not na(refLL) and (na(llBroken) or refLL != llBroken)
+        if close < refLL and (aLLon or startOK)
+            if not aLLon
+                aLLon := true
+                aLLref := refLL
+                aLLfar := llTop
+                aLLwick := llBot
+                aLLwickOK := false
+                aLLbar := bar_index
+                aLLcnt := 0
+                aLLswept := llSwept
+                aLLbox := llBox
+                aLLzbar := llZoneBar
+                aLLarch := false
+                nStarted += 1
+            if close < aLLwick
+                aLLwickOK := true
+            if impDnC
+                aLLcnt := holdBars
+            else if holdDnC
+                aLLcnt += 1
+            else if strictMode
+                aLLcnt := 0
+            if aLLcnt >= holdBars and (not needWickOK or aLLwickOK) and (not useSweepFilter or aLLswept)
+                llBroken := aLLref
+                llBrokenFar := aLLfar
+                if keepBroken and not na(aLLbox)
+                    box.set_bgcolor(aLLbox, color.new(bullCol, math.max(zoneTransp - 15, 0)))
+                    if not aLLarch
+                        pushLocBox(aLLbox)
+                else if not keepBroken and not na(aLLbox)
+                    if aLLarch
+                        removeLocBox(aLLbox)
+                    box.delete(aLLbox)
+                if aLLzbar == llZoneBar
+                    llBox := na
+                    llSwept := false
+                aLLbox := na
+                aLLarch := false
+                if useRetest
+                    if rtLLon
+                        nRetestFail += 1
+                    rtLLon := true
+                    rtLLlvl := aLLref
+                    rtLLbar := bar_index
+                    rtLLstb := aLLbar
+                    rtLLtouched := false
+                    rtLLfar := aLLfar
+                else
+                    sigLocDn := true
+                    sLvlLocDn := aLLref
+                    sBarLocDn := aLLbar
+                    sFarLocDn := aLLfar
+                aLLon := false
+                aLLcnt := 0
+            else if bar_index - aLLbar >= holdWindow
+                failedTry := true
+                nFailWindow += 1
+                aLLon := false
+                aLLcnt := 0
+                if aLLarch and not na(aLLbox)
+                    removeLocBox(aLLbox)
+                    box.delete(aLLbox)
+                aLLbox := na
+                aLLarch := false
+        else
+            if aLLon
+                failedTry := true
+                nFailBack += 1
+            aLLon := false
+            aLLcnt := 0
+            if aLLarch and not na(aLLbox)
+                removeLocBox(aLLbox)
+                box.delete(aLLbox)
+            aLLbox := na
+            aLLarch := false
+    if showEarly
+        eLLlbl := syncEarly(aLLon, aLLcnt, holdBars, eLLlbl, high, false, bearCol)
+
+    refGH = aGHon ? aGHref : zGH
+    if not na(refGH) and (na(ghBroken) or refGH != ghBroken)
+        if close > refGH and (aGHon or startOK)
+            if not aGHon
+                aGHon := true
+                aGHref := refGH
+                aGHfar := ghBot
+                aGHwick := ghTop
+                aGHwickOK := false
+                aGHbar := bar_index
+                aGHcnt := 0
+                aGHswept := ghSwept
+                aGHbox := ghBox
+                aGHzbar := ghBar
+                aGHarch := false
+                nStarted += 1
+            if close > aGHwick
+                aGHwickOK := true
+            if impUpC
+                aGHcnt := holdBars
+            else if holdUpC
+                aGHcnt += 1
+            else if strictMode
+                aGHcnt := 0
+            if aGHcnt >= holdBars and (not needWickOK or aGHwickOK) and (not useSweepFilter or aGHswept)
+                ghBroken := aGHref
+                ghBrokenFar := aGHfar
+                if keepBroken and not na(aGHbox)
+                    box.set_bgcolor(aGHbox, color.new(bearCol, math.max(zoneTransp - 15, 0)))
+                    if not aGHarch
+                        pushGlobBox(aGHbox)
+                else if not keepBroken and not na(aGHbox)
+                    if aGHarch
+                        removeGlobBox(aGHbox)
+                    box.delete(aGHbox)
+                if aGHzbar == ghBar
+                    ghBox := na
+                    ghSwept := false
+                aGHbox := na
+                aGHarch := false
+                if useRetest
+                    if rtGHon
+                        nRetestFail += 1
+                    rtGHon := true
+                    rtGHlvl := aGHref
+                    rtGHbar := bar_index
+                    rtGHstb := aGHbar
+                    rtGHtouched := false
+                    rtGHfar := aGHfar
+                else
+                    sigGlobUp := true
+                    sLvlGlobUp := aGHref
+                    sBarGlobUp := aGHbar
+                    sFarGlobUp := aGHfar
+                aGHon := false
+                aGHcnt := 0
+            else if bar_index - aGHbar >= holdWindow
+                failedTry := true
+                nFailWindow += 1
+                aGHon := false
+                aGHcnt := 0
+                if aGHarch and not na(aGHbox)
+                    removeGlobBox(aGHbox)
+                    box.delete(aGHbox)
+                aGHbox := na
+                aGHarch := false
+        else
+            if aGHon
+                failedTry := true
+                nFailBack += 1
+            aGHon := false
+            aGHcnt := 0
+            if aGHarch and not na(aGHbox)
+                removeGlobBox(aGHbox)
+                box.delete(aGHbox)
+            aGHbox := na
+            aGHarch := false
+    if showEarly
+        eGHlbl := syncEarly(aGHon, aGHcnt, holdBars, eGHlbl, low, true, bullCol)
+
+    refGL = aGLon ? aGLref : zGL
+    if not na(refGL) and (na(glBroken) or refGL != glBroken)
+        if close < refGL and (aGLon or startOK)
+            if not aGLon
+                aGLon := true
+                aGLref := refGL
+                aGLfar := glTop
+                aGLwick := glBot
+                aGLwickOK := false
+                aGLbar := bar_index
+                aGLcnt := 0
+                aGLswept := glSwept
+                aGLbox := glBox
+                aGLzbar := glBar
+                aGLarch := false
+                nStarted += 1
+            if close < aGLwick
+                aGLwickOK := true
+            if impDnC
+                aGLcnt := holdBars
+            else if holdDnC
+                aGLcnt += 1
+            else if strictMode
+                aGLcnt := 0
+            if aGLcnt >= holdBars and (not needWickOK or aGLwickOK) and (not useSweepFilter or aGLswept)
+                glBroken := aGLref
+                glBrokenFar := aGLfar
+                if keepBroken and not na(aGLbox)
+                    box.set_bgcolor(aGLbox, color.new(bullCol, math.max(zoneTransp - 15, 0)))
+                    if not aGLarch
+                        pushGlobBox(aGLbox)
+                else if not keepBroken and not na(aGLbox)
+                    if aGLarch
+                        removeGlobBox(aGLbox)
+                    box.delete(aGLbox)
+                if aGLzbar == glBar
+                    glBox := na
+                    glSwept := false
+                aGLbox := na
+                aGLarch := false
+                if useRetest
+                    if rtGLon
+                        nRetestFail += 1
+                    rtGLon := true
+                    rtGLlvl := aGLref
+                    rtGLbar := bar_index
+                    rtGLstb := aGLbar
+                    rtGLtouched := false
+                    rtGLfar := aGLfar
+                else
+                    sigGlobDn := true
+                    sLvlGlobDn := aGLref
+                    sBarGlobDn := aGLbar
+                    sFarGlobDn := aGLfar
+                aGLon := false
+                aGLcnt := 0
+            else if bar_index - aGLbar >= holdWindow
+                failedTry := true
+                nFailWindow += 1
+                aGLon := false
+                aGLcnt := 0
+                if aGLarch and not na(aGLbox)
+                    removeGlobBox(aGLbox)
+                    box.delete(aGLbox)
+                aGLbox := na
+                aGLarch := false
+        else
+            if aGLon
+                failedTry := true
+                nFailBack += 1
+            aGLon := false
+            aGLcnt := 0
+            if aGLarch and not na(aGLbox)
+                removeGlobBox(aGLbox)
+                box.delete(aGLbox)
+            aGLbox := na
+            aGLarch := false
+    if showEarly
+        eGLlbl := syncEarly(aGLon, aGLcnt, holdBars, eGLlbl, high, false, bearCol)
+
+    // ===== СЛОМЫ ============================================================
+    if sigLocUp
+        nLocSlom += 1
+        lvl = sLvlLocUp
+        stb = sBarLocUp
+        air = false
+        if locLastDir == 1 and not na(locLastLvl)
+            air := lvl <= locLastLvl
+        locLastDir := 1
+        locLastLvl := lvl
+        float vpPoc = na
+        float vpVaLo = na
+        float vpVaHi = na
+        if useVpFilter or showVpLines
+            [vaP, vaLo, vaHi] = computeVA(vpLookback, vpRows, vpVaPct)
+            vpPoc := vaP
+            vpVaLo := vaLo
+            vpVaHi := vaHi
+        emaBad   = useEmaFilter and emaTrend == -1
+        htfBad   = useHtfEmaFilter and htfTrend == -1
+        vwapBad  = useVwapFilter and not na(vwapVal) and close < vwapVal
+        avwapBad = useAvwapFilter and not na(avwapVal) and close < avwapVal
+        vpBad    = useVpFilter and not na(vpVaHi) and close <= vpVaHi
+        oiBad    = useOiFilter and oiDataOK and not oiRising
+        vpDataOK = not na(vpVaHi)
+        totalChk = 1 + (useEmaFilter and emaDataOK ? 1 : 0) + (useHtfEmaFilter and htfDataOK ? 1 : 0) + (useVwapFilter and vwapDataOK ? 1 : 0) + (useAvwapFilter and avwapDataOK ? 1 : 0) + (useVpFilter and vpDataOK ? 1 : 0) + (useOiFilter and oiDataOK ? 1 : 0)
+        passChk  = (air ? 0 : 1) + (useEmaFilter and emaDataOK ? (emaBad ? 0 : 1) : 0) + (useHtfEmaFilter and htfDataOK ? (htfBad ? 0 : 1) : 0) + (useVwapFilter and vwapDataOK ? (vwapBad ? 0 : 1) : 0) + (useAvwapFilter and avwapDataOK ? (avwapBad ? 0 : 1) : 0) + (useVpFilter and vpDataOK ? (vpBad ? 0 : 1) : 0) + (useOiFilter and oiDataOK ? (oiBad ? 0 : 1) : 0)
+        full     = passChk == totalChk
+        emitLocUp := not gateSignalsByScore or full
+        if showLoc and (full or showWeak)
+            scoreTxt = full ? "" : " " + str.tostring(passChk) + "/" + str.tostring(totalChk)
+            txt = "ЛОК↑" + scoreTxt
+            lb = label.new(bar_index, low, txt, style = label.style_label_up, color = color.new(bullCol, full ? 15 : 60), textcolor = color.white, size = size.tiny, tooltip = "ЛОКАЛЬНЫЙ слом\nУровень: " + str.tostring(lvl, format.mintick) + sigBarsTxt + str.tostring(bar_index - stb) + "\nСкор: " + str.tostring(passChk) + "/" + str.tostring(totalChk))
+            pushSig(lb)
+            locLblUp := lb
+            locLblUpBar := bar_index
+            locStopUp := na
+            locTakeUp := na
+            locTakeLblUp := na
+            if showBrokenRef
+                ln = line.new(stb, lvl, bar_index, lvl, color = color.new(bullCol, 30), style = line.style_dotted, width = 1)
+                pushLocLine(ln)
+                locLineUp := ln
+            else
+                locLineUp := na
+            if showVpLines and not na(vpPoc)
+                vpLn1 = line.new(bar_index - vpLookback + 1, vpPoc, bar_index, vpPoc, color = color.new(color.yellow, 20), width = 1)
+                vpLn2 = line.new(bar_index - vpLookback + 1, vpVaHi, bar_index, vpVaHi, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1)
+                vpLn3 = line.new(bar_index - vpLookback + 1, vpVaLo, bar_index, vpVaLo, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1)
+                pushLocLine(vpLn1)
+                pushLocLine(vpLn2)
+                pushLocLine(vpLn3)
+                locVpPocUp := vpLn1
+                locVpVaHiUp := vpLn2
+                locVpVaLoUp := vpLn3
+            else
+                locVpPocUp := na
+                locVpVaHiUp := na
+                locVpVaLoUp := na
+        if showStopTake and (full or showWeak)
+            stopLvl = sFarLocUp - slBufferViz * atr14
+            stopDist = close - stopLvl
+            if stopDist > 0
+                takeLvl = close + stopDist * rrRatioViz
+                stLn = line.new(bar_index, stopLvl, bar_index + 30, stopLvl, color = color.new(bearCol, 0), style = line.style_dashed, width = 1)
+                tkLn = line.new(bar_index, takeLvl, bar_index + 30, takeLvl, color = color.new(bullCol, 0), style = line.style_dashed, width = 1)
+                tkLbl = label.new(bar_index + 30, takeLvl, "TP " + str.tostring(rrRatioViz, "#.#") + "R", style = label.style_label_left, color = color.new(bullCol, 20), textcolor = color.white, size = size.tiny)
+                pushStopTake(stLn)
+                pushStopTake(tkLn)
+                pushStopTakeLbl(tkLbl)
+                locStopUp := stLn
+                locTakeUp := tkLn
+                locTakeLblUp := tkLbl
+                locLblUpBar := bar_index
+
+    if sigLocDn
+        nLocSlom += 1
+        lvl = sLvlLocDn
+        stb = sBarLocDn
+        air = false
+        if locLastDir == -1 and not na(locLastLvl)
+            air := lvl >= locLastLvl
+        locLastDir := -1
+        locLastLvl := lvl
+        float vpPoc = na
+        float vpVaLo = na
+        float vpVaHi = na
+        if useVpFilter or showVpLines
+            [vaP, vaLo, vaHi] = computeVA(vpLookback, vpRows, vpVaPct)
+            vpPoc := vaP
+            vpVaLo := vaLo
+            vpVaHi := vaHi
+        emaBad   = useEmaFilter and emaTrend == 1
+        htfBad   = useHtfEmaFilter and htfTrend == 1
+        vwapBad  = useVwapFilter and not na(vwapVal) and close > vwapVal
+        avwapBad = useAvwapFilter and not na(avwapVal) and close > avwapVal
+        vpBad    = useVpFilter and not na(vpVaLo) and close >= vpVaLo
+        oiBad    = useOiFilter and oiDataOK and not oiRising
+        vpDataOK = not na(vpVaLo)
+        totalChk = 1 + (useEmaFilter and emaDataOK ? 1 : 0) + (useHtfEmaFilter and htfDataOK ? 1 : 0) + (useVwapFilter and vwapDataOK ? 1 : 0) + (useAvwapFilter and avwapDataOK ? 1 : 0) + (useVpFilter and vpDataOK ? 1 : 0) + (useOiFilter and oiDataOK ? 1 : 0)
+        passChk  = (air ? 0 : 1) + (useEmaFilter and emaDataOK ? (emaBad ? 0 : 1) : 0) + (useHtfEmaFilter and htfDataOK ? (htfBad ? 0 : 1) : 0) + (useVwapFilter and vwapDataOK ? (vwapBad ? 0 : 1) : 0) + (useAvwapFilter and avwapDataOK ? (avwapBad ? 0 : 1) : 0) + (useVpFilter and vpDataOK ? (vpBad ? 0 : 1) : 0) + (useOiFilter and oiDataOK ? (oiBad ? 0 : 1) : 0)
+        full     = passChk == totalChk
+        emitLocDn := not gateSignalsByScore or full
+        if showLoc and (full or showWeak)
+            scoreTxt = full ? "" : " " + str.tostring(passChk) + "/" + str.tostring(totalChk)
+            txt = "ЛОК↓" + scoreTxt
+            lb = label.new(bar_index, high, txt, style = label.style_label_down, color = color.new(bearCol, full ? 15 : 60), textcolor = color.white, size = size.tiny, tooltip = "ЛОКАЛЬНЫЙ слом\nУровень: " + str.tostring(lvl, format.mintick) + sigBarsTxt + str.tostring(bar_index - stb) + "\nСкор: " + str.tostring(passChk) + "/" + str.tostring(totalChk))
+            pushSig(lb)
+            locLblDn := lb
+            locLblDnBar := bar_index
+            locStopDn := na
+            locTakeDn := na
+            locTakeLblDn := na
+            if showBrokenRef
+                ln = line.new(stb, lvl, bar_index, lvl, color = color.new(bearCol, 30), style = line.style_dotted, width = 1)
+                pushLocLine(ln)
+                locLineDn := ln
+            else
+                locLineDn := na
+            if showVpLines and not na(vpPoc)
+                vpLn1 = line.new(bar_index - vpLookback + 1, vpPoc, bar_index, vpPoc, color = color.new(color.yellow, 20), width = 1)
+                vpLn2 = line.new(bar_index - vpLookback + 1, vpVaHi, bar_index, vpVaHi, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1)
+                vpLn3 = line.new(bar_index - vpLookback + 1, vpVaLo, bar_index, vpVaLo, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1)
+                pushLocLine(vpLn1)
+                pushLocLine(vpLn2)
+                pushLocLine(vpLn3)
+                locVpPocDn := vpLn1
+                locVpVaHiDn := vpLn2
+                locVpVaLoDn := vpLn3
+            else
+                locVpPocDn := na
+                locVpVaHiDn := na
+                locVpVaLoDn := na
+        if showStopTake and (full or showWeak)
+            stopLvl = sFarLocDn + slBufferViz * atr14
+            stopDist = stopLvl - close
+            if stopDist > 0
+                takeLvl = close - stopDist * rrRatioViz
+                stLn = line.new(bar_index, stopLvl, bar_index + 30, stopLvl, color = color.new(bearCol, 0), style = line.style_dashed, width = 1)
+                tkLn = line.new(bar_index, takeLvl, bar_index + 30, takeLvl, color = color.new(bullCol, 0), style = line.style_dashed, width = 1)
+                tkLbl = label.new(bar_index + 30, takeLvl, "TP " + str.tostring(rrRatioViz, "#.#") + "R", style = label.style_label_left, color = color.new(bearCol, 20), textcolor = color.white, size = size.tiny)
+                pushStopTake(stLn)
+                pushStopTake(tkLn)
+                pushStopTakeLbl(tkLbl)
+                locStopDn := stLn
+                locTakeDn := tkLn
+                locTakeLblDn := tkLbl
+                locLblDnBar := bar_index
+
+    if sigGlobUp
+        nGlobSlom += 1
+        lvl = sLvlGlobUp
+        stb = sBarGlobUp
+        air = false
+        if globLastDir == 1 and not na(globLastLvl)
+            air := lvl <= globLastLvl
+        globLastDir := 1
+        globLastLvl := lvl
+        float vpPoc = na
+        float vpVaLo = na
+        float vpVaHi = na
+        if useVpFilter or showVpLines
+            [vaP, vaLo, vaHi] = computeVA(vpLookback, vpRows, vpVaPct)
+            vpPoc := vaP
+            vpVaLo := vaLo
+            vpVaHi := vaHi
+        emaBad   = useEmaFilter and emaTrend == -1
+        htfBad   = useHtfEmaFilter and htfTrend == -1
+        vwapBad  = useVwapFilter and not na(vwapVal) and close < vwapVal
+        avwapBad = useAvwapFilter and not na(avwapVal) and close < avwapVal
+        vpBad    = useVpFilter and not na(vpVaHi) and close <= vpVaHi
+        oiBad    = useOiFilter and oiDataOK and not oiRising
+        vpDataOK = not na(vpVaHi)
+        totalChk = 1 + (useEmaFilter and emaDataOK ? 1 : 0) + (useHtfEmaFilter and htfDataOK ? 1 : 0) + (useVwapFilter and vwapDataOK ? 1 : 0) + (useAvwapFilter and avwapDataOK ? 1 : 0) + (useVpFilter and vpDataOK ? 1 : 0) + (useOiFilter and oiDataOK ? 1 : 0)
+        passChk  = (air ? 0 : 1) + (useEmaFilter and emaDataOK ? (emaBad ? 0 : 1) : 0) + (useHtfEmaFilter and htfDataOK ? (htfBad ? 0 : 1) : 0) + (useVwapFilter and vwapDataOK ? (vwapBad ? 0 : 1) : 0) + (useAvwapFilter and avwapDataOK ? (avwapBad ? 0 : 1) : 0) + (useVpFilter and vpDataOK ? (vpBad ? 0 : 1) : 0) + (useOiFilter and oiDataOK ? (oiBad ? 0 : 1) : 0)
+        full     = passChk == totalChk
+        emitGlobUp := not gateSignalsByScore or full
+        scoreVis   = full or showWeak
+        globVisUp  = showGlob and scoreVis
+        dedupLocUp = emitGlobUp and not na(locLblUpBar) and bar_index - locLblUpBar <= dupWindow
+        if dedupLocUp and globVisUp
+            if not na(locLblUp)
+                removeSig(locLblUp)
+                label.delete(locLblUp)
+                locLblUp := na
+            if not na(locLineUp)
+                removeLocLine(locLineUp)
+                line.delete(locLineUp)
+                locLineUp := na
+            if not na(locVpPocUp)
+                removeLocLine(locVpPocUp)
+                line.delete(locVpPocUp)
+                locVpPocUp := na
+            if not na(locVpVaHiUp)
+                removeLocLine(locVpVaHiUp)
+                line.delete(locVpVaHiUp)
+                locVpVaHiUp := na
+            if not na(locVpVaLoUp)
+                removeLocLine(locVpVaLoUp)
+                line.delete(locVpVaLoUp)
+                locVpVaLoUp := na
+        if dedupLocUp and showStopTake and scoreVis
+            if not na(locStopUp)
+                removeStopTake(locStopUp)
+                line.delete(locStopUp)
+                locStopUp := na
+            if not na(locTakeUp)
+                removeStopTake(locTakeUp)
+                line.delete(locTakeUp)
+                locTakeUp := na
+            if not na(locTakeLblUp)
+                removeStopTakeLbl(locTakeLblUp)
+                label.delete(locTakeLblUp)
+                locTakeLblUp := na
+        if globVisUp
+            scoreTxt = full ? "" : " " + str.tostring(passChk) + "/" + str.tostring(totalChk)
+            txt = "ГЛОБ↑" + scoreTxt
+            glb = label.new(bar_index, low, txt, style = label.style_label_up, color = color.new(bullCol, full ? 0 : 55), textcolor = color.white, size = size.small, tooltip = "ГЛОБАЛЬНЫЙ слом\nУровень: " + str.tostring(lvl, format.mintick) + sigBarsTxt + str.tostring(bar_index - stb) + "\nСкор: " + str.tostring(passChk) + "/" + str.tostring(totalChk))
+            pushSig(glb)
+            if showBrokenRef
+                pushGlobLine(line.new(stb, lvl, bar_index, lvl, color = color.new(bullCol, 10), style = line.style_dashed, width = 1))
+            if showVpLines and not na(vpPoc)
+                pushGlobLine(line.new(bar_index - vpLookback + 1, vpPoc, bar_index, vpPoc, color = color.new(color.yellow, 20), width = 2))
+                pushGlobLine(line.new(bar_index - vpLookback + 1, vpVaHi, bar_index, vpVaHi, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1))
+                pushGlobLine(line.new(bar_index - vpLookback + 1, vpVaLo, bar_index, vpVaLo, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1))
+        if showStopTake and scoreVis
+            stopLvl = sFarGlobUp - slBufferViz * atr14
+            stopDist = close - stopLvl
+            if stopDist > 0
+                takeLvl = close + stopDist * rrRatioViz
+                pushStopTake(line.new(bar_index, stopLvl, bar_index + 30, stopLvl, color = color.new(bearCol, 0), style = line.style_dashed, width = 2))
+                pushStopTake(line.new(bar_index, takeLvl, bar_index + 30, takeLvl, color = color.new(bullCol, 0), style = line.style_dashed, width = 2))
+                pushStopTakeLbl(label.new(bar_index + 30, takeLvl, "TP " + str.tostring(rrRatioViz, "#.#") + "R", style = label.style_label_left, color = color.new(bullCol, 20), textcolor = color.white, size = size.small))
+
+    if sigGlobDn
+        nGlobSlom += 1
+        lvl = sLvlGlobDn
+        stb = sBarGlobDn
+        air = false
+        if globLastDir == -1 and not na(globLastLvl)
+            air := lvl >= globLastLvl
+        globLastDir := -1
+        globLastLvl := lvl
+        float vpPoc = na
+        float vpVaLo = na
+        float vpVaHi = na
+        if useVpFilter or showVpLines
+            [vaP, vaLo, vaHi] = computeVA(vpLookback, vpRows, vpVaPct)
+            vpPoc := vaP
+            vpVaLo := vaLo
+            vpVaHi := vaHi
+        emaBad   = useEmaFilter and emaTrend == 1
+        htfBad   = useHtfEmaFilter and htfTrend == 1
+        vwapBad  = useVwapFilter and not na(vwapVal) and close > vwapVal
+        avwapBad = useAvwapFilter and not na(avwapVal) and close > avwapVal
+        vpBad    = useVpFilter and not na(vpVaLo) and close >= vpVaLo
+        oiBad    = useOiFilter and oiDataOK and not oiRising
+        vpDataOK = not na(vpVaLo)
+        totalChk = 1 + (useEmaFilter and emaDataOK ? 1 : 0) + (useHtfEmaFilter and htfDataOK ? 1 : 0) + (useVwapFilter and vwapDataOK ? 1 : 0) + (useAvwapFilter and avwapDataOK ? 1 : 0) + (useVpFilter and vpDataOK ? 1 : 0) + (useOiFilter and oiDataOK ? 1 : 0)
+        passChk  = (air ? 0 : 1) + (useEmaFilter and emaDataOK ? (emaBad ? 0 : 1) : 0) + (useHtfEmaFilter and htfDataOK ? (htfBad ? 0 : 1) : 0) + (useVwapFilter and vwapDataOK ? (vwapBad ? 0 : 1) : 0) + (useAvwapFilter and avwapDataOK ? (avwapBad ? 0 : 1) : 0) + (useVpFilter and vpDataOK ? (vpBad ? 0 : 1) : 0) + (useOiFilter and oiDataOK ? (oiBad ? 0 : 1) : 0)
+        full     = passChk == totalChk
+        emitGlobDn := not gateSignalsByScore or full
+        scoreVis   = full or showWeak
+        globVisDn  = showGlob and scoreVis
+        dedupLocDn = emitGlobDn and not na(locLblDnBar) and bar_index - locLblDnBar <= dupWindow
+        if dedupLocDn and globVisDn
+            if not na(locLblDn)
+                removeSig(locLblDn)
+                label.delete(locLblDn)
+                locLblDn := na
+            if not na(locLineDn)
+                removeLocLine(locLineDn)
+                line.delete(locLineDn)
+                locLineDn := na
+            if not na(locVpPocDn)
+                removeLocLine(locVpPocDn)
+                line.delete(locVpPocDn)
+                locVpPocDn := na
+            if not na(locVpVaHiDn)
+                removeLocLine(locVpVaHiDn)
+                line.delete(locVpVaHiDn)
+                locVpVaHiDn := na
+            if not na(locVpVaLoDn)
+                removeLocLine(locVpVaLoDn)
+                line.delete(locVpVaLoDn)
+                locVpVaLoDn := na
+        if dedupLocDn and showStopTake and scoreVis
+            if not na(locStopDn)
+                removeStopTake(locStopDn)
+                line.delete(locStopDn)
+                locStopDn := na
+            if not na(locTakeDn)
+                removeStopTake(locTakeDn)
+                line.delete(locTakeDn)
+                locTakeDn := na
+            if not na(locTakeLblDn)
+                removeStopTakeLbl(locTakeLblDn)
+                label.delete(locTakeLblDn)
+                locTakeLblDn := na
+        if globVisDn
+            scoreTxt = full ? "" : " " + str.tostring(passChk) + "/" + str.tostring(totalChk)
+            txt = "ГЛОБ↓" + scoreTxt
+            glb = label.new(bar_index, high, txt, style = label.style_label_down, color = color.new(bearCol, full ? 0 : 55), textcolor = color.white, size = size.small, tooltip = "ГЛОБАЛЬНЫЙ слом\nУровень: " + str.tostring(lvl, format.mintick) + sigBarsTxt + str.tostring(bar_index - stb) + "\nСкор: " + str.tostring(passChk) + "/" + str.tostring(totalChk))
+            pushSig(glb)
+            if showBrokenRef
+                pushGlobLine(line.new(stb, lvl, bar_index, lvl, color = color.new(bearCol, 10), style = line.style_dashed, width = 1))
+            if showVpLines and not na(vpPoc)
+                pushGlobLine(line.new(bar_index - vpLookback + 1, vpPoc, bar_index, vpPoc, color = color.new(color.yellow, 20), width = 2))
+                pushGlobLine(line.new(bar_index - vpLookback + 1, vpVaHi, bar_index, vpVaHi, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1))
+                pushGlobLine(line.new(bar_index - vpLookback + 1, vpVaLo, bar_index, vpVaLo, color = color.new(color.yellow, 60), style = line.style_dotted, width = 1))
+        if showStopTake and scoreVis
+            stopLvl = sFarGlobDn + slBufferViz * atr14
+            stopDist = stopLvl - close
+            if stopDist > 0
+                takeLvl = close - stopDist * rrRatioViz
+                pushStopTake(line.new(bar_index, stopLvl, bar_index + 30, stopLvl, color = color.new(bearCol, 0), style = line.style_dashed, width = 2))
+                pushStopTake(line.new(bar_index, takeLvl, bar_index + 30, takeLvl, color = color.new(bullCol, 0), style = line.style_dashed, width = 2))
+                pushStopTakeLbl(label.new(bar_index + 30, takeLvl, "TP " + str.tostring(rrRatioViz, "#.#") + "R", style = label.style_label_left, color = color.new(bearCol, 20), textcolor = color.white, size = size.small))
+
+// ─────────────────────────────────────────────────────────────────────────────
+plotshape(showFailed and failedTry, "Сгоревшая попытка закрепа", shape.xcross, location.belowbar, color.new(color.gray, 55), size = size.tiny)
+
+var table tp = na
+if (showTrend or showFunnel) and barstate.islast
+    if na(tp)
+        tp := table.new(position.top_right, 2, 12, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 60))
+
+    hdrBg = color.new(color.gray, 80)
+    txtC  = color.new(color.silver, 0)
+
+    if showTrend
+        emaTxt = emaTrend == 1 ? "аптренд" : emaTrend == -1 ? "даунтренд" : "нет тренда"
+        emaClr = emaTrend == 1 ? bullCol : emaTrend == -1 ? bearCol : neutCol
+        strTrend = globLastDir != 0 ? globLastDir : locLastDir
+        strTxt = strTrend == 1 ? "аптренд" : strTrend == -1 ? "даунтренд" : "нет данных"
+        strClr = strTrend == 1 ? bullCol : strTrend == -1 ? bearCol : neutCol
+        agree    = emaTrend != 0 and strTrend != 0 and emaTrend == strTrend
+        conflict = emaTrend != 0 and strTrend != 0 and emaTrend != strTrend
+        sumTxt = agree ? (emaTrend == 1 ? "АПТРЕНД" : "ДАУНТРЕНД") : conflict ? "РАСХОЖДЕНИЕ" : "НЕ ОПРЕДЕЛЁН"
+        sumClr = agree ? (emaTrend == 1 ? bullCol : bearCol) : conflict ? color.orange : neutCol
+
+        table.cell(tp, 0, 0, "Тренд", text_size = size.tiny, text_color = txtC, bgcolor = hdrBg)
+        table.cell(tp, 1, 0, timeframe.period, text_size = size.tiny, text_color = txtC, bgcolor = hdrBg)
+        table.cell(tp, 0, 1, "EMA 50/200", text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 1, 1, emaTxt, text_size = size.tiny, text_color = emaClr)
+        table.cell(tp, 0, 2, "Структура", text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 1, 2, strTxt, text_size = size.tiny, text_color = strClr)
+        table.cell(tp, 0, 3, "Итог", text_size = size.tiny, text_color = txtC, bgcolor = hdrBg)
+        table.cell(tp, 1, 3, sumTxt, text_size = size.tiny, text_color = sumClr, bgcolor = hdrBg)
+
+    if showFunnel
+        conv = nStarted > 0 ? 100.0 * (nLocSlom + nGlobSlom) / nStarted : na
+        resid    = nStarted - nFailBack - nFailWindow - nRebind - nLocSlom - nGlobSlom - nRetestFail
+        residClr = resid < 0 ? color.red : resid > 0 ? color.orange : txtC
+        table.cell(tp, 0, 4, "ВОРОНКА", text_size = size.tiny, text_color = txtC, bgcolor = hdrBg)
+        table.cell(tp, 1, 4, str.tostring(bar_index + 1) + " баров", text_size = size.tiny, text_color = txtC, bgcolor = hdrBg)
+        table.cell(tp, 0, 5, "Пробоев начато", text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 1, 5, str.tostring(nStarted), text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 0, 6, "Возврат за уровень", text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 1, 6, str.tostring(nFailBack), text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 0, 7, "Окно закрепа истекло", text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 1, 7, str.tostring(nFailWindow), text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 0, 8, "Перепривязка / невязка", text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 1, 8, str.tostring(nRebind) + " / " + str.tostring(resid), text_size = size.tiny, text_color = residClr)
+        table.cell(tp, 0, 9, "Уровней «воскресло»", text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 1, 9, str.tostring(nReborn), text_size = size.tiny, text_color = txtC)
+        if useRetest
+            table.cell(tp, 0, 10, "Ретест: не подтверждено", text_size = size.tiny, text_color = txtC)
+            table.cell(tp, 1, 10, str.tostring(nRetestFail), text_size = size.tiny, text_color = txtC)
+        table.cell(tp, 0, 11, "СЛОМЫ (лок / глоб)", text_size = size.tiny, text_color = txtC, bgcolor = hdrBg)
+        table.cell(tp, 1, 11, str.tostring(nLocSlom) + " / " + str.tostring(nGlobSlom) + (na(conv) ? "" : "  " + str.tostring(conv, "#") + "%"), text_size = size.tiny, text_color = txtC, bgcolor = hdrBg)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Локальный сигнал гасится глобальным той же стороны по факту ЭМИССИИ
+// глобального. Настройки отрисовки (showGlob/showWeak/showStopTake) сюда не
+// примешиваются: косметический чекбокс не должен менять состав сигналов и,
+// как следствие, результат бэктеста ниже.
+if emitGlobUp
+    emitLocUp := false
+if emitGlobDn
+    emitLocDn := false
+
+alertcondition(emitGlobUp, "Глобальный слом ВВЕРХ", "Слом: глобальный ВВЕРХ")
+alertcondition(emitGlobDn, "Глобальный слом ВНИЗ",  "Слом: глобальный ВНИЗ")
+alertcondition(emitLocUp,  "Локальный слом ВВЕРХ",  "Слом: локальный ВВЕРХ")
+alertcondition(emitLocDn,  "Локальный слом ВНИЗ",   "Слом: локальный ВНИЗ")
+
+// =====================================================================
+// 10. СТРАТЕГИЯ: ИСПОЛНЕНИЕ
+// Вход строго по уже дедуплицированным/гейтованным сигналам движка
+// (emitLocUp/emitLocDn/emitGlobUp/emitGlobDn) — та же логика, что видна на
+// графике и уходит в алерты. Стоп/тейк — та же формула, что рисует
+// showStopTake (sFar* ± slBufferViz×ATR14, R:R = rrRatioViz), поэтому
+// нарисованное на графике всегда совпадает с тем, что реально исполняется.
+// =====================================================================
+entryLong  = (useGlobSignalsTrade and emitGlobUp) or (useLocSignalsTrade and emitLocUp)
+entryShort = (useGlobSignalsTrade and emitGlobDn) or (useLocSignalsTrade and emitLocDn)
+
+// В подавляющем большинстве баров одновременно эмитится не больше одного
+// сигнала на сторону (глобальный гасит локальный того же бара выше по файлу),
+// поэтому выбор "какой far-уровень использовать" однозначен без доп. приоритетов.
+longFarLevel  = useGlobSignalsTrade and emitGlobUp ? sFarGlobUp : (useLocSignalsTrade and emitLocUp ? sFarLocUp : na)
+shortFarLevel = useGlobSignalsTrade and emitGlobDn ? sFarGlobDn : (useLocSignalsTrade and emitLocDn ? sFarLocDn : na)
+
+var float activeLongStop  = na
+var float activeLongTP    = na
+var float activeShortStop = na
+var float activeShortTP   = na
+
+canEnterLong  = strategy.position_size == 0 or (flipOnOppositeSignal and strategy.position_size < 0)
+canEnterShort = strategy.position_size == 0 or (flipOnOppositeSignal and strategy.position_size > 0)
+
+if entryLong and allowLong and not na(longFarLevel) and canEnterLong
+    longStopPrice = longFarLevel - slBufferViz * atr14
+    longStopDist  = close - longStopPrice
+    if longStopDist > 0
+        qtyLong = (strategy.equity * riskPctPerTrade / 100) / longStopDist
+        strategy.entry("Long", strategy.long, qty = qtyLong)
+        activeLongStop := longStopPrice
+        activeLongTP   := close + longStopDist * rrRatioViz
+
+if entryShort and allowShort and not na(shortFarLevel) and canEnterShort
+    shortStopPrice = shortFarLevel + slBufferViz * atr14
+    shortStopDist  = shortStopPrice - close
+    if shortStopDist > 0
+        qtyShort = (strategy.equity * riskPctPerTrade / 100) / shortStopDist
+        strategy.entry("Short", strategy.short, qty = qtyShort)
+        activeShortStop := shortStopPrice
+        activeShortTP   := close - shortStopDist * rrRatioViz
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry = "Long", stop = activeLongStop, limit = activeLongTP)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry = "Short", stop = activeShortStop, limit = activeShortTP)
+
+plot(strategy.position_size > 0 ? activeLongStop  : na, "Активный Long стоп",  color = color.new(bearCol, 0), style = plot.style_linebr)
+plot(strategy.position_size > 0 ? activeLongTP    : na, "Активный Long тейк",  color = color.new(bullCol, 0), style = plot.style_linebr)
+plot(strategy.position_size < 0 ? activeShortStop : na, "Активный Short стоп", color = color.new(bearCol, 0), style = plot.style_linebr)
+plot(strategy.position_size < 0 ? activeShortTP   : na, "Активный Short тейк", color = color.new(bullCol, 0), style = plot.style_linebr)
+
+var table ts = na
+if barstate.islast
+    if na(ts)
+        ts := table.new(position.bottom_right, 2, 4, border_width = 1, bgcolor = color.new(color.black, 70))
+    table.cell(ts, 0, 0, "Позиция", text_size = size.tiny, text_color = color.white)
+    table.cell(ts, 1, 0, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", text_size = size.tiny, text_color = color.yellow)
+    table.cell(ts, 0, 1, "Размер", text_size = size.tiny, text_color = color.white)
+    table.cell(ts, 1, 1, str.tostring(strategy.position_size, "#.########"), text_size = size.tiny, text_color = color.white)
+    table.cell(ts, 0, 2, "Equity", text_size = size.tiny, text_color = color.white)
+    table.cell(ts, 1, 2, str.tostring(strategy.equity, "#.##"), text_size = size.tiny, text_color = color.white)
+    table.cell(ts, 0, 3, "Открытый P/L", text_size = size.tiny, text_color = color.white)
+    table.cell(ts, 1, 3, str.tostring(strategy.openprofit, "#.##"), text_size = size.tiny, text_color = strategy.openprofit >= 0 ? bullCol : bearCol)
