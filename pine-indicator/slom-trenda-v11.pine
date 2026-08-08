@@ -107,7 +107,7 @@ macdSig     = input.int(9,  "MACD: сигнальная EMA", minval = 2, group 
 divSource   = input.string("MACD-линия", "Сравнивать по", options = ["MACD-линия", "Гистограмма"], group = G7)
 
 G9 = "9. Стоп/тейк на сломе"
-showStopTake = input.bool(false, "Показывать стоп/тейк на сломе", group = G9)
+showStopTake = input.bool(true, "Показывать стоп/тейк на сломе", group = G9)
 rrRatioViz   = input.float(3.0, "R:R", minval = 0.5, step = 0.5, group = G9)
 slBufferViz  = input.float(0.3, "Стоп: доп. буфер за зоной, × ATR14", minval = 0, step = 0.1, group = G9)
 
